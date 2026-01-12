@@ -305,7 +305,7 @@ def check_asymptote_inf(value, tol=1e-6):
     return abs(value) < tol
 
 
-def check_asymptote_zero(value, tol=1e-6):
+def check_asymptote_zero(value):
     """
     Check if an evaluated x->0+ asymptote is acceptable (positive).
 
@@ -313,8 +313,6 @@ def check_asymptote_zero(value, tol=1e-6):
     ----------
     value : float or None
         Evaluated asymptote value.
-    tol : float
-        Tolerance for considering a value as zero.
 
     Returns
     -------
@@ -323,17 +321,47 @@ def check_asymptote_zero(value, tol=1e-6):
     """
     if value is None:
         return False
-    return value > tol
+    return value > 0
+
+
+def _numerical_limit(expr, x, direction):
+    """
+    Compute limit using sympy's limit function.
+
+    Parameters
+    ----------
+    expr : sympy expression
+        Expression with numerical coefficients.
+    x : sympy symbol
+        The variable.
+    direction : str
+        '0+' for x->0+ or 'inf' for x->inf.
+
+    Returns
+    -------
+    float or None
+        The limit value, or None if computation fails.
+    """
+    # print("This is 1")
+    try:
+        if direction == '0+':
+            result = limit(expr, x, 1e-16, '+')
+        else:
+            result = limit(expr, x, oo)
+        return float(result.evalf())
+    except Exception:
+        return None
 
 
 def _compute_limit_worker(expr_str, result_queue):
     """Worker function for subprocess-based limit computation."""
+    # print("this is B")
     try:
         x = symbols('x', positive=True)
         expr = sympify(expr_str, locals={'x': x})
 
         try:
-            lim_zero = float(limit(expr, x, 0, '+').evalf())
+            lim_zero = float(limit(expr, x, 1e-16, '+').evalf())
         except Exception:
             lim_zero = None
 
@@ -372,22 +400,19 @@ def compute_asymptotes_with_params(expr_str, params, round_decimals=5,
     tuple
         (lim_zero, lim_inf) where each is float or None if computation fails.
     """
+    # print(f"Computing asymptotes for expression: {expr_str}")
+    # print(f"With parameters: {params}")
     try:
         parser = SympyParser()
         expr = parser.parse(expr_str)
         x = parser._x
 
-        # Substitute numerical values (use Python floats, not sympy Float)
+        # Substitute numerical values using N() to force numerical evaluation
         subs_dict = {
-            parser._free_params[i]: round(params[i + 1], round_decimals)
+            parser._free_params[i]: N(round(params[i + 1], round_decimals))
             for i in range(min(len(params) - 1, 4))
         }
         expr_numerical = expr.subs(subs_dict)
-        # Parser uses Abs(..., evaluate=False) - rebuild to force evaluation
-        expr_numerical = expr_numerical.replace(
-            lambda e: isinstance(e, Abs),
-            lambda e: Abs(e.args[0])
-        )
 
         # Use subprocess timeout if requested (MPI-safe)
         if timeout > 0:
@@ -417,16 +442,13 @@ def compute_asymptotes_with_params(expr_str, params, round_decimals=5,
             except Exception:
                 return None, None
 
-        # No timeout - compute directly
-        try:
-            lim_zero = float(limit(expr_numerical, x, 0, '+').evalf())
-        except Exception:
-            lim_zero = None
-
-        try:
-            lim_inf = float(limit(expr_numerical, x, oo).evalf())
-        except Exception:
-            lim_inf = None
+        # Try numerical evaluation first (much faster)
+        # print(expr_numerical)
+        # print("A")
+        lim_zero = _numerical_limit(expr_numerical, x, '0+')
+        # print("B")
+        lim_inf = _numerical_limit(expr_numerical, x, 'inf')
+        # print("C")
 
         return lim_zero, lim_inf
 
