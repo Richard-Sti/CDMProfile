@@ -1,7 +1,7 @@
 """CDM Profile package."""
 
 from . import data, fitting, symbolic
-from .data import HaloCollection, load_from_folder
+from .data import HaloData, load_from_folder
 from .fitting import compile_fitter, compute_asymptotes_with_params
 from .symbolic import SympyParser
 
@@ -11,7 +11,7 @@ __all__ = [
     "data",
     "fitting",
     "symbolic",
-    "HaloCollection",
+    "HaloData",
     "load_from_folder",
     "compile_fitter",
     "compute_asymptotes_with_params",
