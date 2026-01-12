@@ -61,9 +61,20 @@ def _check_equation(idx, eq):
     return None
 
 
-def _compute_asymptote(idx, eq):
+def _compute_asymptote(idx, eq, verbose=False, rank=0):
     """
     Compute limits as x -> 0+ and x -> infinity for an equation.
+
+    Parameters
+    ----------
+    idx : int
+        Index of the equation.
+    eq : str
+        The equation string.
+    verbose : bool, optional
+        If True, print progress for each limit computation.
+    rank : int, optional
+        MPI rank (for verbose output).
 
     Returns
     -------
@@ -79,6 +90,9 @@ def _compute_asymptote(idx, eq):
     local_dict = {'x': x}
     local_dict.update({f'a{i}': params[i] for i in range(4)})
 
+    if verbose:
+        print(f"  [Rank {rank}] idx={idx} computing lim(x->0+): {eq}",
+              flush=True)
     try:
         expr = sympify(eq, locals=local_dict)
         lim_zero = limit(expr, x, 0, '+')
@@ -87,6 +101,9 @@ def _compute_asymptote(idx, eq):
         # If SymPy can't compute it, mark as unknown (will pass by default)
         lim_zero_str = "unknown"
 
+    if verbose:
+        print(f"  [Rank {rank}] idx={idx} computing lim(x->inf): {eq}",
+              flush=True)
     try:
         expr = sympify(eq, locals=local_dict)
         lim_inf = limit(expr, x, oo)
@@ -98,7 +115,7 @@ def _compute_asymptote(idx, eq):
     return (idx, eq, lim_zero_str, lim_inf_str)
 
 
-def compute_asymptotes(targetdir, comp, comm, skip_idx=None):
+def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
     """
     Compute asymptotic behavior for all equations (MPI parallelized).
 
@@ -116,6 +133,8 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None):
         MPI communicator.
     skip_idx : set, optional
         Set of indices already rejected by validation (excluded from stats).
+    verbose : bool, optional
+        If True, print each limit computation (helps debug stuck limits).
 
     Returns
     -------
@@ -174,11 +193,12 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None):
 
     n_local = len(local_indices)
     for i, idx in enumerate(local_indices):
-        result = _compute_asymptote(idx, equations[idx])
+        result = _compute_asymptote(idx, equations[idx], verbose=verbose,
+                                    rank=rank)
         local_results.append(result)
 
         # Progress indicator (each rank prints its own progress)
-        if (i + 1) % 100 == 0 or (i + 1) == n_local:
+        if not verbose and ((i + 1) % 100 == 0 or (i + 1) == n_local):
             pct = 100 * (i + 1) / n_local
             print(f"  Rank {rank}: {i + 1}/{n_local} ({pct:.0f}%)", flush=True)
 
@@ -522,12 +542,18 @@ if __name__ == "__main__":
     n_total, n_no_x, n_norm_only, n_bad = counts
     skip_idx = comm.bcast(skip_idx, root=0)
 
+    # Read config for verbose flag
+    config = None
     if rank == 0:
+        config = read_config()
         print("Computing asymptotes...")
+    config = comm.bcast(config, root=0)
+    asymp_verbose = config.get("fitting", {}).get("asymp_verbose", False)
 
     # Compute asymptotic behavior (all ranks participate)
     # Pass skip_idx so stats only count non-skipped functions
-    asymp_stats = compute_asymptotes(targetdir, args.comp, comm, skip_idx)
+    asymp_stats = compute_asymptotes(targetdir, args.comp, comm, skip_idx,
+                                     verbose=asymp_verbose)
 
     # Broadcast asymp_stats to rank 0
     asymp_stats = comm.bcast(asymp_stats, root=0)

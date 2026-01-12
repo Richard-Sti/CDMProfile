@@ -376,6 +376,85 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
     return avg_score
 
 
+def check_postfit_asymptotes(func_idx, expr_str, func_results, binned,
+                             fit_config, asymp_inf_threshold,
+                             asymp_zero_threshold, print_prefix=""):
+    """
+    Check post-fit asymptotes for a function.
+
+    Parameters
+    ----------
+    func_idx : int
+        Function index.
+    expr_str : str
+        Expression string.
+    func_results : list
+        List of (func_idx, halo_id, loss, params, converged, neval) tuples.
+    binned : dict
+        Binned halo data.
+    fit_config : dict
+        Fitting configuration.
+    asymp_inf_threshold : float
+        Threshold for x->inf asymptote pass rate.
+    asymp_zero_threshold : float
+        Threshold for x->0+ asymptote pass rate.
+    print_prefix : str, optional
+        Prefix for verbose output (e.g., "Rank 0: ").
+
+    Returns
+    -------
+    tuple
+        (reject, n_pass_inf, n_pass_zero, n_success)
+    """
+    n_success = len(func_results)
+    n_pass_inf = 0
+    n_pass_zero = 0
+    round_dec = fit_config.get('asymp_round_decimals', 5)
+    asymp_timeout = fit_config.get('asymp_timeout', 0)
+    asymp_verbose = fit_config.get('asymp_verbose', False)
+
+    if asymp_verbose:
+        # Compute avg normalized loss (loss/npart)
+        norm_losses = []
+        for r in func_results:
+            halo_id = r[1]
+            npart = np.sum(binned['bin_counts'][halo_id])
+            norm_losses.append(r[2] / npart)
+        avg_norm_loss = np.mean(norm_losses)
+        print(f"{print_prefix}func {func_idx} asymptote check "
+              f"(avg_loss/npart={avg_norm_loss:.4f}, "
+              f"n_halos={n_success}): {expr_str}", flush=True)
+
+    for i_r, r in enumerate(func_results):
+        params = r[3]
+        halo_id = r[1]
+        if asymp_verbose:
+            print(f"  {print_prefix}halo {i_r+1}/{n_success} "
+                  f"(id={halo_id}) fit done", flush=True)
+            print(f"    params={params}", flush=True)
+        lim_zero, lim_inf = cdmprof.compute_asymptotes_with_params(
+            expr_str, params, round_decimals=round_dec, timeout=asymp_timeout)
+        if asymp_verbose:
+            print(f"    limit done: x->0+={lim_zero}, x->inf={lim_inf}",
+                  flush=True)
+
+        if cdmprof.fitting.check_asymptote_inf(lim_inf):
+            n_pass_inf += 1
+        if cdmprof.fitting.check_asymptote_zero(lim_zero):
+            n_pass_zero += 1
+
+    # Check thresholds
+    reject = False
+    frac_pass_inf = n_pass_inf / n_success
+    if frac_pass_inf < asymp_inf_threshold:
+        reject = True
+    frac_pass_zero = n_pass_zero / n_success
+    if frac_pass_zero < asymp_zero_threshold:
+        reject = True
+
+    return reject, n_pass_inf, n_pass_zero, n_success
+
+
 def print_best_results(output_path, equations, npart_per_halo,
                        asymp_postfit_funcs=None, nfw_score=None, n_top=100):
     """
@@ -977,32 +1056,11 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
                                    or has_unknown_check)
 
             if needs_postfit_check and not skip_asymp:
-                n_pass_inf = 0
-                n_pass_zero = 0
-                round_dec = fit_config.get('asymp_round_decimals', 5)
-                asymp_timeout = fit_config.get('asymp_timeout', 0)
-
-                for r in func_results:
-                    params = r[3]
-                    lim_zero, lim_inf = cdmprof.compute_asymptotes_with_params(
-                        expr_str, params, round_decimals=round_dec,
-                        timeout=asymp_timeout)
-
-                    if cdmprof.fitting.check_asymptote_inf(lim_inf):
-                        n_pass_inf += 1
-                    if cdmprof.fitting.check_asymptote_zero(lim_zero):
-                        n_pass_zero += 1
-
-                # Apply thresholds to both asymptotes (both must pass)
-                frac_pass_inf = n_pass_inf / n_success
-                if frac_pass_inf < asymp_inf_threshold:
-                    reject_asymp = True
-
-                frac_pass_zero = n_pass_zero / n_success
-                if frac_pass_zero < asymp_zero_threshold:
-                    reject_asymp = True
-
-                # Store pass fractions for this function
+                reject_asymp, n_pass_inf, n_pass_zero, n_success = \
+                    check_postfit_asymptotes(
+                        func_idx, expr_str, func_results, binned, fit_config,
+                        asymp_inf_threshold, asymp_zero_threshold,
+                        print_prefix=f"Rank {rank}: ")
                 asymp_pass_fractions[func_idx] = (
                     n_pass_inf, n_pass_zero, n_success)
 
@@ -1145,6 +1203,9 @@ if __name__ == "__main__":
     all_idx = range(len(equations))
     job_queue = [i for i in all_idx
                  if i not in completed_func_idx and i not in skip_func_idx]
+
+    # DEBUG: Only test function 34
+    # job_queue = [34]
 
     # Load and bin halos on rank 0, then broadcast to all
     if rank == 0:
@@ -1340,33 +1401,11 @@ if __name__ == "__main__":
                                        or has_unknown_check)
 
                 if needs_postfit_check and not skip_asymp:
-                    n_pass_inf = 0
-                    n_pass_zero = 0
-                    round_dec = fit_config.get('asymp_round_decimals', 5)
-                    asymp_timeout = fit_config.get('asymp_timeout', 0)
-
-                    for r in func_results:
-                        params = r[3]
-                        lim_zero, lim_inf = \
-                            cdmprof.compute_asymptotes_with_params(
-                                expr_str, params, round_decimals=round_dec,
-                                timeout=asymp_timeout)
-
-                        if cdmprof.fitting.check_asymptote_inf(lim_inf):
-                            n_pass_inf += 1
-                        if cdmprof.fitting.check_asymptote_zero(lim_zero):
-                            n_pass_zero += 1
-
-                    # Apply thresholds to both asymptotes (both must pass)
-                    frac_pass_inf = n_pass_inf / n_success
-                    if frac_pass_inf < asymp_inf_threshold:
-                        reject_asymp = True
-
-                    frac_pass_zero = n_pass_zero / n_success
-                    if frac_pass_zero < asymp_zero_threshold:
-                        reject_asymp = True
-
-                    # Store pass fractions for this function
+                    reject_asymp, n_pass_inf, n_pass_zero, n_success = \
+                        check_postfit_asymptotes(
+                            func_idx, expr_str, func_results, binned,
+                            fit_config, asymp_inf_threshold,
+                            asymp_zero_threshold, print_prefix="")
                     asymp_pass_fractions[func_idx] = (
                         n_pass_inf, n_pass_zero, n_success)
 
