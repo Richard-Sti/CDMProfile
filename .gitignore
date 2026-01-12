@@ -1,0 +1,6 @@
+cdmprof.egg-info/
+venv_cdmprof/
+local_config.toml
+results/
+data/
+__pycache__/

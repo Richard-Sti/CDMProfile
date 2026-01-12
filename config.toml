@@ -1,0 +1,52 @@
+# Main configuration file (git tracked)
+# Machine-specific paths are loaded from local_config.toml (not git tracked)
+
+[fitting]
+# Run name for equations (e.g., ext_maths)
+runname = "ext_maths"
+
+# Binning
+nbin = 100
+
+# MPI work distribution
+batch_size = 15
+
+# Optimizer settings
+maxeval = 5_000
+xtol = 1e-6
+ftol = 1e-6
+
+# Multi-restart settings
+max_restarts = 100
+nconv_required = 5
+conv_rtol = 1e-3
+
+# Asymptotic behavior validation
+# Fraction of halos that must pass for parameter-dependent asymptotes
+asymp_inf_threshold = 0.5   # lim(x->inf) must be ~0
+asymp_zero_threshold = 0.5  # lim(x->0+) must be > 0
+# Whether to reject functions that fail post-fit asymptote checks
+reject_asymp_failures = true
+# Skip post-fit asymptote validation entirely
+skip_postfit_asymp_check = false
+# Round parameters to N decimals for limit computation (avoids sympy hangs)
+asymp_round_decimals = 4
+# Timeout in seconds for limit computation (0 = no timeout, MPI-safe)
+asymp_timeout = 10
+
+# Early stopping: skip remaining halos if first N all fail
+early_stop_failures = 50
+
+# NFW comparison early stopping: skip function if avg loss/npart after first N halos
+# is worse than NFW's avg + factor (absolute threshold).
+nfw_early_stop_enabled = true
+nfw_early_stop_halos = 50    # Check after this many successful fits
+nfw_early_stop_factor = 1.0 # Stop if avg > NFW_avg + factor
+
+# Parameter bounds for fitting
+# Rs bounds are relative to halo rmin/rmax
+Rs_lower_factor = 0.25      # Rs_min = rmin * Rs_lower_factor
+Rs_upper_factor = 10.0      # Rs_max = rmax * Rs_upper_factor
+# a0-a3 bounds (absolute)
+a_lower = -500.0
+a_upper = 500.0
