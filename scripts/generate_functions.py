@@ -26,9 +26,8 @@ import esr.generation.duplicate_checker  # noqa
 import esr.generation.generator as generator  # noqa
 from mpi4py import MPI
 
+import cdmprof
 from utils import read_config
-from cdmprof.fitting import (is_bad_function, load_equations,
-                             _has_normalization_only_param)
 
 
 def generate_functions(runname, comp):
@@ -55,9 +54,9 @@ def _check_equation(idx, eq):
     """
     if not _has_x_dependence(eq):
         return (idx, "no_x_dependence", eq)
-    elif _has_normalization_only_param(eq):
+    elif cdmprof.fitting._has_normalization_only_param(eq):
         return (idx, "normalization_only", eq)
-    elif is_bad_function(eq):
+    elif cdmprof.fitting.is_bad_function(eq):
         return (idx, "bad_function", eq)
     return None
 
@@ -142,7 +141,7 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None):
             print(f"No equations file found at {eq_path}")
             equations = None
         else:
-            equations = load_equations(eq_path)
+            equations = cdmprof.fitting.load_equations(eq_path)
     else:
         equations = None
 
@@ -158,8 +157,8 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None):
         'inf_ok': 0,        # lim(x->inf) is 0
         'inf_unknown': 0,   # lim(x->inf) couldn't be computed
         'total_bad': 0,     # unique functions with ANY bad asymptote
-        'total_param': 0,   # unique functions with param-dep (and no bad)
-        'total_unknown': 0, # unique functions with unknown asymptotes (post-fit check)
+        'total_param': 0,   # unique functions with param-dep (no bad)
+        'total_unknown': 0,  # unknown asymptotes (post-fit check)
         'total_ok': 0,      # unique functions with all OK asymptotes
     }
 
@@ -170,9 +169,18 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None):
     n_equations = len(equations)
     local_results = []
 
-    for idx in range(rank, n_equations, size):
+    # Get indices for this rank
+    local_indices = list(range(rank, n_equations, size))
+
+    n_local = len(local_indices)
+    for i, idx in enumerate(local_indices):
         result = _compute_asymptote(idx, equations[idx])
         local_results.append(result)
+
+        # Progress indicator (each rank prints its own progress)
+        if (i + 1) % 100 == 0 or (i + 1) == n_local:
+            pct = 100 * (i + 1) / n_local
+            print(f"  Rank {rank}: {i + 1}/{n_local} ({pct:.0f}%)", flush=True)
 
     # Gather results to rank 0
     all_results = comm.gather(local_results, root=0)
@@ -323,7 +331,7 @@ def validate_equations(targetdir, comp, comm):
     Returns
     -------
     tuple
-        (n_total, n_no_x, n_norm_only, n_bad, skip_idx) where skip_idx is a set.
+        (n_total, n_no_x, n_norm_only, n_bad, skip_idx).
     """
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -337,7 +345,7 @@ def validate_equations(targetdir, comp, comm):
             print(f"No equations file found at {eq_path}")
             equations = None
         else:
-            equations = load_equations(eq_path)
+            equations = cdmprof.fitting.load_equations(eq_path)
     else:
         equations = None
 
@@ -402,61 +410,61 @@ def print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats):
     # Step 2: No x dependence
     remaining = n_total - n_no_x
     pct = 100 * n_no_x / n_total if n_total > 0 else 0
-    print(f"\n2. Remove no x-dependence:               -{n_no_x:>5} ({pct:>5.1f}%)")
-    print(f"   Remaining:                            {remaining:>6}")
+    print(f"\n2. Remove no x-dependence:       -{n_no_x:>5} ({pct:>5.1f}%)")
+    print(f"   Remaining:                    {remaining:>6}")
 
     # Step 3: Normalization-only
     remaining2 = remaining - n_norm_only
     pct = 100 * n_norm_only / n_total if n_total > 0 else 0
-    print(f"\n3. Remove normalization-only params:     -{n_norm_only:>5} ({pct:>5.1f}%)")
-    print(f"   Remaining:                            {remaining2:>6}")
+    print(f"\n3. Remove norm-only:         -{n_norm_only:>5} ({pct:>5.1f}%)")
+    print(f"   Remaining:                    {remaining2:>6}")
 
     # Step 4: Bad functions (trig, nan, inf)
     remaining3 = remaining2 - n_bad
     pct = 100 * n_bad / n_total if n_total > 0 else 0
-    print(f"\n4. Remove bad functions (trig/nan/inf):  -{n_bad:>5} ({pct:>5.1f}%)")
-    print(f"   Remaining:                            {remaining3:>6}")
+    print(f"\n4. Remove bad (trig/nan/inf):    -{n_bad:>5} ({pct:>5.1f}%)")
+    print(f"   Remaining:                    {remaining3:>6}")
 
     # Step 5: Asymptotes
-    print(f"\n5. Asymptotic behavior analysis:")
+    print("\n5. Asymptotic behavior analysis:")
 
     # Show x->0+ breakdown
-    print(f"   lim(x->0+):")
-    print(f"     <= 0 (rejected):         {asymp_stats['zero_bad']:>5}")
-    print(f"     > 0, definite (OK):      {asymp_stats['zero_ok']:>5}")
-    print(f"     param-dependent:         {asymp_stats['zero_param']:>5}")
-    print(f"     unknown (post-fit):      {asymp_stats['zero_unknown']:>5}")
+    print("   lim(x->0+):")
+    print(f"     <= 0 (rejected):       {asymp_stats['zero_bad']:>5}")
+    print(f"     > 0, definite (OK):    {asymp_stats['zero_ok']:>5}")
+    print(f"     param-dependent:       {asymp_stats['zero_param']:>5}")
+    print(f"     unknown (post-fit):    {asymp_stats['zero_unknown']:>5}")
 
     # Show x->inf breakdown
-    print(f"   lim(x->inf):")
-    print(f"     != 0 (rejected):         {asymp_stats['inf_bad']:>5}")
-    print(f"     = 0, definite (OK):      {asymp_stats['inf_ok']:>5}")
-    print(f"     param-dependent:         {asymp_stats['inf_param']:>5}")
-    print(f"     unknown (post-fit):      {asymp_stats['inf_unknown']:>5}")
+    print("   lim(x->inf):")
+    print(f"     != 0 (rejected):       {asymp_stats['inf_bad']:>5}")
+    print(f"     = 0, definite (OK):    {asymp_stats['inf_ok']:>5}")
+    print(f"     param-dependent:       {asymp_stats['inf_param']:>5}")
+    print(f"     unknown (post-fit):    {asymp_stats['inf_unknown']:>5}")
 
     # Combined rejections (use total_bad to avoid double-counting)
     n_asymp_bad = asymp_stats['total_bad']
     remaining4 = remaining3 - n_asymp_bad
     pct = 100 * n_asymp_bad / n_total if n_total > 0 else 0
-    print(f"\n   Total rejected (bad asymptotes):      -{n_asymp_bad:>5} ({pct:>5.1f}%)")
-    print(f"   Remaining:                            {remaining4:>6}")
+    print(f"\n   Rejected (bad asymp):     -{n_asymp_bad:>5} ({pct:>5.1f}%)")
+    print(f"   Remaining:                    {remaining4:>6}")
 
-    # Final summary (use total_param and total_unknown to avoid double-counting)
+    # Final summary
     n_param_dep = asymp_stats['total_param']
     n_unknown = asymp_stats['total_unknown']
     n_ready = asymp_stats['total_ok']
-    print(f"\n" + "-" * 70)
-    print(f"READY FOR FITTING:")
-    print(f"  Definitely valid:                      {n_ready:>6}")
-    print(f"  Parameter-dependent asymptotes:        {n_param_dep:>6}")
-    print(f"  Unknown asymptotes (post-fit check):   {n_unknown:>6}")
-    print(f"  Total to fit:                          {remaining4:>6}")
+    print("\n" + "-" * 70)
+    print("READY FOR FITTING:")
+    print(f"  Definitely valid:              {n_ready:>6}")
+    print(f"  Parameter-dependent:           {n_param_dep:>6}")
+    print(f"  Unknown (post-fit check):      {n_unknown:>6}")
+    print(f"  Total to fit:                  {remaining4:>6}")
 
     total_eliminated = n_total - remaining4
     pct_eliminated = 100 * total_eliminated / n_total if n_total > 0 else 0
     pct_remaining = 100 * remaining4 / n_total if n_total > 0 else 0
-    print(f"\n  Eliminated:                            {total_eliminated:>6} ({pct_eliminated:.1f}%)")
-    print(f"  Kept:                                  {remaining4:>6} ({pct_remaining:.1f}%)")
+    print(f"\n  Eliminated:  {total_eliminated:>6} ({pct_eliminated:.1f}%)")
+    print(f"  Kept:        {remaining4:>6} ({pct_remaining:.1f}%)")
     print("=" * 70)
     print("")
 
@@ -529,7 +537,7 @@ if __name__ == "__main__":
         print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats)
 
         # Print output file locations
-        print(f"Output files:")
+        print("Output files:")
         print(f"  {join(targetdir, f'unique_equations_{args.comp}.txt')}")
         print(f"  {join(targetdir, f'skip_functions_{args.comp}.txt')}")
         print(f"  {join(targetdir, f'asymptotes_zero_{args.comp}.txt')}")
