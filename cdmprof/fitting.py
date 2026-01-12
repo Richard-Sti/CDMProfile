@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 from cffi import FFI
-from sympy import Abs, Float, N, ccode, limit, oo, simplify, symbols, sympify
+from sympy import Abs, N, ccode, limit, oo, simplify, symbols, sympify
 
 from .symbolic import SympyParser
 
@@ -330,11 +330,18 @@ def _compute_limit_worker(expr_str, result_queue):
     """Worker function for subprocess-based limit computation."""
     try:
         x = symbols('x', positive=True)
-        # Expression is already numerical, just parse and compute
         expr = sympify(expr_str, locals={'x': x})
 
-        lim_zero = float(limit(expr, x, 0, '+').evalf())
-        lim_inf = float(limit(expr, x, oo).evalf())
+        try:
+            lim_zero = float(limit(expr, x, 0, '+').evalf())
+        except Exception:
+            lim_zero = None
+
+        try:
+            lim_inf = float(limit(expr, x, oo).evalf())
+        except Exception:
+            lim_inf = None
+
         result_queue.put(('success', lim_zero, lim_inf))
     except Exception:
         result_queue.put(('error', None, None))
@@ -370,11 +377,17 @@ def compute_asymptotes_with_params(expr_str, params, round_decimals=5,
         expr = parser.parse(expr_str)
         x = parser._x
 
-        # Substitute numerical values, rounded to avoid huge rationals
-        subs_dict = {parser._free_params[i]: Float(round(params[i + 1],
-                                                         round_decimals))
-                     for i in range(min(len(params) - 1, 4))}
-        expr_numerical = expr.subs(subs_dict).evalf()
+        # Substitute numerical values (use Python floats, not sympy Float)
+        subs_dict = {
+            parser._free_params[i]: round(params[i + 1], round_decimals)
+            for i in range(min(len(params) - 1, 4))
+        }
+        expr_numerical = expr.subs(subs_dict)
+        # Parser uses Abs(..., evaluate=False) - rebuild to force evaluation
+        expr_numerical = expr_numerical.replace(
+            lambda e: isinstance(e, Abs),
+            lambda e: Abs(e.args[0])
+        )
 
         # Use subprocess timeout if requested (MPI-safe)
         if timeout > 0:
