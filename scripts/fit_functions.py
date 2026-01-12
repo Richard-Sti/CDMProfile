@@ -404,17 +404,28 @@ def check_postfit_asymptotes(func_idx, expr_str, func_results, binned,
     Returns
     -------
     tuple
-        (reject, n_pass_inf, n_pass_zero, n_success)
+        (reject, n_pass_inf, n_pass_zero, n_checked)
     """
-    n_success = len(func_results)
-    n_pass_inf = 0
-    n_pass_zero = 0
+    n_total = len(func_results)
     round_dec = fit_config.get('asymp_round_decimals', 5)
     asymp_timeout = fit_config.get('asymp_timeout', 0)
     asymp_verbose = fit_config.get('asymp_verbose', False)
+    asymp_n_halos = fit_config.get('asymp_n_halos', 10)
+
+    # Sample halos if asymp_n_halos is set and less than total
+    if asymp_n_halos > 0 and asymp_n_halos < n_total:
+        rng = np.random.default_rng(seed=42)
+        sample_idx = rng.choice(n_total, size=asymp_n_halos, replace=False)
+        results_to_check = [func_results[i] for i in sorted(sample_idx)]
+    else:
+        results_to_check = func_results
+
+    n_checked = len(results_to_check)
+    n_pass_inf = 0
+    n_pass_zero = 0
 
     if asymp_verbose:
-        # Compute avg normalized loss (loss/npart)
+        # Compute avg normalized loss (loss/npart) over all results
         norm_losses = []
         for r in func_results:
             halo_id = r[1]
@@ -423,13 +434,13 @@ def check_postfit_asymptotes(func_idx, expr_str, func_results, binned,
         avg_norm_loss = np.mean(norm_losses)
         print(f"{print_prefix}func {func_idx} asymptote check "
               f"(avg_loss/npart={avg_norm_loss:.4f}, "
-              f"n_halos={n_success}): {expr_str}", flush=True)
+              f"n_check={n_checked}/{n_total}): {expr_str}", flush=True)
 
-    for i_r, r in enumerate(func_results):
+    for i_r, r in enumerate(results_to_check):
         params = r[3]
         halo_id = r[1]
         if asymp_verbose:
-            print(f"  {print_prefix}halo {i_r+1}/{n_success} "
+            print(f"  {print_prefix}halo {i_r+1}/{n_checked} "
                   f"(id={halo_id}) fit done", flush=True)
             print(f"    params={params}", flush=True)
         lim_zero, lim_inf = cdmprof.compute_asymptotes_with_params(
@@ -445,14 +456,14 @@ def check_postfit_asymptotes(func_idx, expr_str, func_results, binned,
 
     # Check thresholds
     reject = False
-    frac_pass_inf = n_pass_inf / n_success
+    frac_pass_inf = n_pass_inf / n_checked
     if frac_pass_inf < asymp_inf_threshold:
         reject = True
-    frac_pass_zero = n_pass_zero / n_success
+    frac_pass_zero = n_pass_zero / n_checked
     if frac_pass_zero < asymp_zero_threshold:
         reject = True
 
-    return reject, n_pass_inf, n_pass_zero, n_success
+    return reject, n_pass_inf, n_pass_zero, n_checked
 
 
 def print_best_results(output_path, equations, npart_per_halo,
@@ -1056,13 +1067,13 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
                                    or has_unknown_check)
 
             if needs_postfit_check and not skip_asymp:
-                reject_asymp, n_pass_inf, n_pass_zero, n_success = \
+                reject_asymp, n_pass_inf, n_pass_zero, n_checked = \
                     check_postfit_asymptotes(
                         func_idx, expr_str, func_results, binned, fit_config,
                         asymp_inf_threshold, asymp_zero_threshold,
                         print_prefix=f"Rank {rank}: ")
                 asymp_pass_fractions[func_idx] = (
-                    n_pass_inf, n_pass_zero, n_success)
+                    n_pass_inf, n_pass_zero, n_checked)
 
             if reject_asymp:
                 asymp_reject_func_idx.add(func_idx)
@@ -1205,7 +1216,7 @@ if __name__ == "__main__":
                  if i not in completed_func_idx and i not in skip_func_idx]
 
     # DEBUG: Only test function 34
-    # job_queue = [34]
+    # job_queue = [275]
 
     # Load and bin halos on rank 0, then broadcast to all
     if rank == 0:
@@ -1274,6 +1285,8 @@ if __name__ == "__main__":
 
         n_funcs = len(job_queue)
         t_start = time()
+        total_fit_time = 0.0
+        total_asymp_time = 0.0
 
         asymp_inf_threshold = fit_config.get('asymp_inf_threshold', 0.5)
         asymp_zero_threshold = fit_config.get('asymp_zero_threshold', 0.5)
@@ -1304,6 +1317,7 @@ if __name__ == "__main__":
             early_stopped = False
             nfw_early_stopped = False
 
+            t_fit_start = time()
             for halo_idx in range(n_halos):
                 try:
                     result = fitter.fit_with_restarts(
@@ -1366,6 +1380,9 @@ if __name__ == "__main__":
                         if n_consecutive_failures >= early_stop_threshold:
                             early_stopped = True
                             break
+            func_fit_time = time() - t_fit_start
+            total_fit_time += func_fit_time
+            func_asymp_time = 0.0
 
             if early_stopped:
                 print(f"Func {func_idx} early stopped after "
@@ -1401,13 +1418,16 @@ if __name__ == "__main__":
                                        or has_unknown_check)
 
                 if needs_postfit_check and not skip_asymp:
-                    reject_asymp, n_pass_inf, n_pass_zero, n_success = \
+                    t_asymp_start = time()
+                    reject_asymp, n_pass_inf, n_pass_zero, n_checked = \
                         check_postfit_asymptotes(
                             func_idx, expr_str, func_results, binned,
                             fit_config, asymp_inf_threshold,
                             asymp_zero_threshold, print_prefix="")
+                    func_asymp_time = time() - t_asymp_start
+                    total_asymp_time += func_asymp_time
                     asymp_pass_fractions[func_idx] = (
-                        n_pass_inf, n_pass_zero, n_success)
+                        n_pass_inf, n_pass_zero, n_checked)
 
                 if reject_asymp:
                     asymp_reject_func_idx.add(func_idx)
@@ -1440,14 +1460,28 @@ if __name__ == "__main__":
                 eta_str = f"{remaining:.1f} s"
 
             print(f"Completed {funcs_done}/{n_funcs} | "
-                  f"this: {func_time:.1f}s | avg: {avg_per_func:.1f}s/func | "
-                  f"ETA: {eta_str}", flush=True)
+                  f"this: {func_time:.1f}s (fit={func_fit_time:.1f}, "
+                  f"asymp={func_asymp_time:.1f}) | "
+                  f"avg: {avg_per_func:.1f}s/func | ETA: {eta_str}",
+                  flush=True)
 
         # Merge all results (including any from previous runs if resuming)
         merge_results(temp_dir, output_path, delete_rank_files=True)
         if temp_dir.exists():
             temp_dir.rmdir()
         print(f"All done! Results saved to: {output_path}", flush=True)
+
+        # Print timing summary
+        total_time = time() - t_start
+        other_time = total_time - total_fit_time - total_asymp_time
+        print("\nTiming breakdown:", flush=True)
+        print(f"  Fitting:    {total_fit_time:8.1f}s "
+              f"({100*total_fit_time/total_time:5.1f}%)", flush=True)
+        print(f"  Asymptotes: {total_asymp_time:8.1f}s "
+              f"({100*total_asymp_time/total_time:5.1f}%)", flush=True)
+        print(f"  Other:      {other_time:8.1f}s "
+              f"({100*other_time/total_time:5.1f}%)", flush=True)
+        print(f"  Total:      {total_time:8.1f}s", flush=True)
 
         # Print failed functions
         print_failed_functions(output_path, equations)
