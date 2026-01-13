@@ -18,6 +18,7 @@ MPI script for fitting density profiles to halo data.
 Uses dynamic work distribution (master-worker pattern) where rank 0
 distributes batches of functions to worker ranks.
 """
+import warnings
 from argparse import ArgumentParser
 from pathlib import Path
 from time import time
@@ -1247,6 +1248,11 @@ if __name__ == "__main__":
     if size == 1:
         # Single process mode: do everything on one CPU
         print("Running in single-process mode", flush=True)
+        asymp_n_halos = fit_config.get('asymp_n_halos', 10)
+        if asymp_n_halos > 0:
+            print(f"Asymptote checks: {asymp_n_halos} random halos", flush=True)
+        else:
+            print("Asymptote checks: all halos", flush=True)
 
         # Compute NFW per-halo scores upfront for early stopping comparison
         nfw_early_stop_halos = fit_config.get('nfw_early_stop_halos', 5)
@@ -1260,7 +1266,6 @@ if __name__ == "__main__":
         if use_nfw_early_stop:
             print("Computing NFW reference scores for early stopping...",
                   flush=True)
-            import warnings
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score, nfw_per_halo = compute_nfw_scores(
@@ -1503,7 +1508,6 @@ if __name__ == "__main__":
         # Compute NFW reference score (reuse if already computed)
         if nfw_score is None:
             print("Computing NFW reference score...", flush=True)
-            import warnings
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score = compute_nfw_scores(binned, fit_config)
@@ -1512,6 +1516,14 @@ if __name__ == "__main__":
 
     else:
         # Multi-process mode: master-worker pattern
+        if rank == 0:
+            asymp_n_halos = fit_config.get('asymp_n_halos', 10)
+            if asymp_n_halos > 0:
+                print(f"Asymptote checks: {asymp_n_halos} random halos",
+                      flush=True)
+            else:
+                print("Asymptote checks: all halos", flush=True)
+
         # Compute NFW per-halo scores on rank 0 for early stopping comparison
         nfw_per_halo = None
         use_nfw_early_stop = fit_config.get('nfw_early_stop_enabled', False)
@@ -1520,7 +1532,6 @@ if __name__ == "__main__":
         if rank == 0 and use_nfw_early_stop:
             print("Computing NFW reference scores for early stopping...",
                   flush=True)
-            import warnings
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 _, nfw_per_halo = compute_nfw_scores(
@@ -1582,6 +1593,8 @@ if __name__ == "__main__":
                                    asymp_unknown)
             # Compute NFW reference score (reuse if already computed)
             print("Computing NFW reference score...", flush=True)
-            nfw_score = compute_nfw_scores(binned, fit_config)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="reimporting")
+                nfw_score = compute_nfw_scores(binned, fit_config)
             print_best_results(output_path, equations, npart_per_halo,
                                asymp_postfit_funcs, nfw_score)
