@@ -19,7 +19,7 @@ ftol = 1e-6
 # Multi-restart settings
 max_restarts = 100
 nconv_required = 5
-conv_rtol = 1e-3
+conv_rtol = 1e-4
 
 # Asymptotic behavior validation
 # Fraction of halos that must pass for parameter-dependent asymptotes
@@ -32,7 +32,11 @@ skip_postfit_asymp_check = false
 # Round parameters to N decimals for limit computation (avoids sympy hangs)
 asymp_round_decimals = 4
 # Timeout in seconds for limit computation (0 = no timeout, MPI-safe)
-asymp_timeout = 10
+asymp_timeout = 0
+# Verbose progress for limit computation (prints each limit being computed)
+asymp_verbose = false
+# Number of halos to check for asymptotes (0 = all halos, randomly sampled)
+asymp_n_halos = 20
 
 # Early stopping: skip remaining halos if first N all fail
 early_stop_failures = 50
