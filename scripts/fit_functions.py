@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Richard Stiskalek
+# Copyright (C) 2025 Richard Stiskalek
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the
 # Free Software Foundation; either version 3 of the License, or (at your
@@ -1250,7 +1250,8 @@ if __name__ == "__main__":
         print("Running in single-process mode", flush=True)
         asymp_n_halos = fit_config.get('asymp_n_halos', 10)
         if asymp_n_halos > 0:
-            print(f"Asymptote checks: {asymp_n_halos} random halos", flush=True)
+            print(f"Asymptote checks: {asymp_n_halos} random halos",
+                  flush=True)
         else:
             print("Asymptote checks: all halos", flush=True)
 
