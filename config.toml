@@ -7,45 +7,47 @@ runname = "ext_maths"
 
 # Binning
 nbin = 100
+n_sample = 0  # Downsample halos to this many particles (0 = no downsampling)
 
 # MPI work distribution
 batch_size = 15
 
+# How often to write results to disk (every N functions)
+write_buffer_size = 10
+
+# Save results to text files (ranking + failed functions by category)
+save_text_results = true
+
 # Optimizer settings
+optimizer = "neldermead"  # Options: "sbplx", "neldermead", "bobyqa"
 maxeval = 5_000
 xtol = 1e-6
 ftol = 1e-6
 
-# Multi-restart settings
-max_restarts = 100
-nconv_required = 5
-conv_rtol = 1e-4
+# Simpson integration for mass normalization
+simpson_n = 512  # Number of intervals (must be even). Higher = more accurate but slower
 
-# Asymptotic behavior validation
-# Fraction of halos that must pass for parameter-dependent asymptotes
-asymp_inf_threshold = 0.5   # lim(x->inf) must be ~0
-asymp_zero_threshold = 0.5  # lim(x->0+) must be > 0
-# Whether to reject functions that fail post-fit asymptote checks
-reject_asymp_failures = true
-# Skip post-fit asymptote validation entirely
-skip_postfit_asymp_check = false
-# Round parameters to N decimals for limit computation (avoids sympy hangs)
-asymp_round_decimals = 4
-# Timeout in seconds for limit computation (0 = no timeout, MPI-safe)
-asymp_timeout = 0
-# Verbose progress for limit computation (prints each limit being computed)
-asymp_verbose = false
-# Number of halos to check for asymptotes (0 = all halos, randomly sampled)
-asymp_n_halos = 20
+# Multi-restart settings (lists indexed by number of free parameters: 1, 2, 3, ...)
+# Functions with more free params than list length use the last value
+max_restarts = [100, 300, 1000]
+nconv_required = [10, 20, 40]
+conv_rtol = 1e-3
+conv_atol = 10
 
 # Early stopping: skip remaining halos if first N all fail
 early_stop_failures = 50
 
+# Minimum fraction of halos that must be successfully fit
+# Functions with fewer successful fits are discarded from ranking
+min_halo_success_fraction = 0.5
+
 # NFW comparison early stopping: skip function if avg loss/npart after first N halos
 # is worse than NFW's avg + factor (absolute threshold).
+# Multiple tiers: checked in order, earlier tiers catch clearly bad functions faster
 nfw_early_stop_enabled = true
-nfw_early_stop_halos = 50    # Check after this many successful fits
-nfw_early_stop_factor = 1.0 # Stop if avg > NFW_avg + factor
+nfw_early_stop_halos = [10, 50, 100]       # Check after this many halos
+nfw_early_stop_factors = [2.0, 1.5, 1] # Stop if avg > NFW_avg + factor
+nfw_early_stop_same_halos = true  # Compare against NFW avg for same N halos (true) or all halos (false)
 
 # Parameter bounds for fitting
 # Rs bounds are relative to halo rmin/rmax
@@ -54,3 +56,25 @@ Rs_upper_factor = 10.0      # Rs_max = rmax * Rs_upper_factor
 # a0-a3 bounds (absolute)
 a_lower = -500.0
 a_upper = 500.0
+
+[asymptotes]
+# Post-fit asymptote validation for parameter-dependent functions
+# Run via: mpirun -n 4 python check_asymptotes.py --results <file> --complexity <n>
+
+# Number of top-ranked functions to validate (0 = all)
+top_n = 100
+
+# Number of halos to sample for validation (0 = all)
+n_halos = 20
+
+# Pass rate thresholds
+inf_threshold = 0.5   # lim(x->inf) must be ~0
+zero_threshold = 0.5  # lim(x->0+) must be > 0
+
+# Computation settings
+round_decimals = 4
+timeout = 0  # seconds, 0 = no timeout
+verbose = false
+
+# MPI batch size
+batch_size = 10
