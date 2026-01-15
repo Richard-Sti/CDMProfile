@@ -20,6 +20,7 @@ distributes batches of functions to worker ranks.
 """
 import warnings
 from argparse import ArgumentParser
+from datetime import datetime
 from pathlib import Path
 from time import time
 
@@ -28,40 +29,33 @@ import h5py
 from mpi4py import MPI
 
 import cdmprof
-from utils import read_config
+from utils import (
+    compute_function_scores,
+    print_best_results,
+    print_failed_functions,
+    read_config,
+)
 
 # MPI tags
 WORK_TAG = 1
 DONE_TAG = 0
 
+# Maximum number of parameters to store (for fixed-size HDF5 datasets)
+MAX_NPARAMS = 10
 
-def get_completed_func_idx(temp_dir):
+
+def get_param_dependent_value(config_value, nfree):
     """
-    Read all rank files and return set of completed func_idx.
+    Get a config value that depends on the number of free parameters.
 
-    Parameters
-    ----------
-    temp_dir : Path
-        Directory containing results_rank*.hdf5 files.
-
-    Returns
-    -------
-    set of int
-        Set of func_idx that have been completed.
+    If config_value is a list, returns the value at index (nfree - 1),
+    or the last value if nfree exceeds the list length.
+    If config_value is a scalar, returns it directly.
     """
-    temp_dir = Path(temp_dir)
-    completed = set()
-
-    for fpath in temp_dir.glob("results_rank*.hdf5"):
-        try:
-            with h5py.File(fpath, 'r') as f:
-                if 'func_idx' in f:
-                    completed.update(f['func_idx'][:].tolist())
-        except Exception:
-            # File might be corrupted or incomplete
-            continue
-
-    return completed
+    if isinstance(config_value, list):
+        idx = min(nfree - 1, len(config_value) - 1)
+        return config_value[max(0, idx)]
+    return config_value
 
 
 def load_skip_functions(skip_path):
@@ -119,178 +113,100 @@ def clear_temp_dir(temp_dir):
     temp_dir.rmdir()
 
 
-def print_failed_functions(output_path, equations):
-    """
-    Print functions that failed to produce any results.
+def write_ranking_to_file(output_path, equations, npart_per_halo,
+                          nfw_score=None, txt_path=None,
+                          min_success_fraction=0.0):
+    """Write ranking of best functions to a text file."""
+    output_path = Path(output_path)
+    if not output_path.exists():
+        return
 
-    Parameters
-    ----------
-    output_path : Path
-        Path to merged HDF5 results file.
-    equations : list of str
-        List of equation strings.
-    """
+    if txt_path is None:
+        txt_path = output_path.with_suffix('.txt')
+    else:
+        txt_path = Path(txt_path)
+
+    scores, asymp_pass_dict, n_halos_total, n_filtered = \
+        compute_function_scores(output_path, npart_per_halo,
+                                min_success_fraction)
+
+    with open(txt_path, 'w') as f:
+        f.write("# Best functions ranked by avg loss/npart per halo\n")
+        f.write("# Lower score is better\n")
+        f.write(f"# Total functions: {len(scores)}\n")
+        f.write(f"# Total halos: {n_halos_total}\n")
+        if n_filtered > 0:
+            min_halos = int(min_success_fraction * n_halos_total)
+            f.write(f"# Filtered out: {n_filtered} functions "
+                    f"(< {min_halos} successful fits)\n")
+        if nfw_score is not None:
+            f.write(f"# NFW reference score: {nfw_score:.6f}\n")
+        f.write("#\n")
+        f.write("# Columns: rank, func_idx, avg_score, n_halos, "
+                "asymp_inf%, asymp_zero%, equation\n")
+        f.write("#\n")
+
+        for rank, (fidx, score, n_halos) in enumerate(scores, 1):
+            eq = equations[fidx]
+            if fidx in asymp_pass_dict:
+                n_inf, n_zero, n_total = asymp_pass_dict[fidx]
+                if n_total > 0:
+                    pct_inf = 100 * n_inf / n_total
+                    pct_zero = 100 * n_zero / n_total
+                else:
+                    pct_inf, pct_zero = -1, -1
+            else:
+                pct_inf, pct_zero = -1, -1
+
+            f.write(f"{rank}\t{fidx}\t{score:.6f}\t{n_halos}\t"
+                    f"{pct_inf:.0f}\t{pct_zero:.0f}\t{eq}\n")
+
+    print(f"Ranking saved to: {txt_path}")
+
+
+def write_failed_to_files(output_path, categories, output_dir=None):
+    """Write failed/skipped functions to separate text files by category."""
     output_path = Path(output_path)
 
-    if not output_path.exists():
-        print("No results file found.")
+    if output_dir is None:
+        output_dir = output_path.parent
+    else:
+        output_dir = Path(output_dir)
+
+    base_name = output_path.stem
+    n_failed = sum(len(v) for v in categories.values())
+    if n_failed == 0:
         return
 
-    with h5py.File(output_path, 'r') as f:
-        if 'func_idx' not in f:
-            successful = set()
-        else:
-            successful = set(f['func_idx'][:].tolist())
+    descriptions = {
+        'negative_loss': 'Negative loss (numerical issues/singularities)',
+        'asymptote': 'Failed post-fit asymptote validation',
+        'normalization_only': 'Normalization-only parameter (pre-skipped)',
+        'bad_function': 'Bad function - contains nan/inf/trig (pre-skipped)',
+        'asymp_prefit': 'Pre-fit asymptote check failed (pre-skipped)',
+        'other': 'Other failures (compilation/fit errors)',
+    }
 
-        # Load negative loss rejections if available
-        if 'negative_loss_func_idx' in f:
-            negative_loss_funcs = set(f['negative_loss_func_idx'][:].tolist())
-        else:
-            negative_loss_funcs = set()
+    files_written = []
+    for cat_name, cat_list in categories.items():
+        if len(cat_list) == 0:
+            continue
 
-        # Load asymptote rejections if available
-        if 'asymp_reject_func_idx' in f:
-            asymp_reject_funcs = set(f['asymp_reject_func_idx'][:].tolist())
-        else:
-            asymp_reject_funcs = set()
+        fpath = output_dir / f"{base_name}_failed_{cat_name}.txt"
+        with open(fpath, 'w') as f:
+            f.write(f"# {descriptions.get(cat_name, cat_name)}\n")
+            f.write(f"# Count: {len(cat_list)}\n")
+            f.write("# Columns: func_idx, equation\n")
+            f.write("#\n")
+            for fidx, eq in cat_list:
+                f.write(f"{fidx}\t{eq}\n")
 
-    all_funcs = set(range(len(equations)))
-    failed = all_funcs - successful
+        files_written.append(fpath)
 
-    if len(failed) == 0:
-        print(f"\nAll {len(equations)} functions produced results.")
-        return
-
-    print(f"\n{'=' * 80}")
-    print(f"SKIPPED/FAILED FUNCTIONS ({len(failed)}/{len(equations)})")
-    print("=" * 80)
-
-    # Categorize failures
-    norm_only = []
-    bad_funcs = []
-    negative_loss = []
-    asymp_rejects = []
-    other_fails = []
-
-    for fidx in sorted(failed):
-        eq = equations[fidx]
-        # Check negative loss first (from actual fitting)
-        if fidx in negative_loss_funcs:
-            negative_loss.append((fidx, eq))
-        # Check asymptote rejections (from post-fit validation)
-        elif fidx in asymp_reject_funcs:
-            asymp_rejects.append((fidx, eq))
-        # Check normalization-only (more specific)
-        elif cdmprof.fitting._has_normalization_only_param(eq):
-            norm_only.append((fidx, eq))
-        elif cdmprof.fitting.is_bad_function(eq):
-            bad_funcs.append((fidx, eq))
-        else:
-            other_fails.append((fidx, eq))
-
-    # Print negative loss functions
-    if len(negative_loss) > 0:
-        print(f"\nNegative loss (numerical issues/singularities): "
-              f"{len(negative_loss)}")
-        if len(negative_loss) <= 20:
-            for fidx, eq in negative_loss:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-        else:
-            for fidx, eq in negative_loss[:10]:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-            print(f"  ... and {len(negative_loss) - 10} more")
-
-    # Print asymptote rejection functions
-    if len(asymp_rejects) > 0:
-        print(f"\nAsymptote validation failed: {len(asymp_rejects)}")
-        if len(asymp_rejects) <= 20:
-            for fidx, eq in asymp_rejects:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-        else:
-            for fidx, eq in asymp_rejects[:10]:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-            print(f"  ... and {len(asymp_rejects) - 10} more")
-
-    # Print normalization-only functions
-    if len(norm_only) > 0:
-        print(f"\nNormalization-only parameter (skipped): {len(norm_only)}")
-        if len(norm_only) <= 20:
-            for fidx, eq in norm_only:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-        else:
-            for fidx, eq in norm_only[:10]:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-            print(f"  ... and {len(norm_only) - 10} more")
-
-    # Print bad functions (nan/inf/trig)
-    if len(bad_funcs) > 0:
-        print(f"\nBad functions (nan/inf/trig, skipped): {len(bad_funcs)}")
-        if len(bad_funcs) <= 20:
-            for fidx, eq in bad_funcs:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-        else:
-            for fidx, eq in bad_funcs[:10]:
-                eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-                print(f"  {fidx}: {eq_short}")
-            print(f"  ... and {len(bad_funcs) - 10} more")
-
-    # Print other failures
-    if len(other_fails) > 0:
-        print(f"\nCompilation/fit failures: {len(other_fails)}")
-        for fidx, eq in other_fails:
-            eq_short = eq[:50] + "..." if len(eq) > 50 else eq
-            print(f"  {fidx}: {eq_short}")
-
-    print("=" * 80)
-    print("")
-
-
-def print_asymptote_summary(n_param_dep, n_unknown, n_rejected, threshold_inf,
-                            threshold_zero):
-    """
-    Print summary of post-fit asymptote validation.
-
-    Parameters
-    ----------
-    n_param_dep : int
-        Number of functions with parameter-dependent asymptotes.
-    n_unknown : int
-        Number of functions with unknown asymptotes.
-    n_rejected : int
-        Number of functions rejected by asymptote validation.
-    threshold_inf : float
-        Threshold for x->inf validation.
-    threshold_zero : float
-        Threshold for x->0+ validation.
-    """
-    n_total = n_param_dep + n_unknown
-    if n_total == 0:
-        return
-
-    n_passed = n_total - n_rejected
-    pct_passed = 100 * n_passed / n_total if n_total > 0 else 0
-    pct_rejected = 100 * n_rejected / n_total if n_total > 0 else 0
-
-    print(f"\n{'=' * 60}")
-    print("POST-FIT ASYMPTOTE VALIDATION")
-    print("=" * 60)
-    print(f"Thresholds: lim(x->inf)~0 >= {100*threshold_inf:.0f}%, "
-          f"lim(x->0+)>0 >= {100*threshold_zero:.0f}%")
-    print("\nFunctions requiring post-fit check:")
-    print(f"  Parameter-dependent:  {n_param_dep:>5}")
-    print(f"  Unknown (recomputed): {n_unknown:>5}")
-    print(f"  Total:                {n_total:>5}")
-    print("\nResults:")
-    print(f"  Passed:   {n_passed:>5} ({pct_passed:.1f}%)")
-    print(f"  Rejected: {n_rejected:>5} ({pct_rejected:.1f}%)")
-    print("=" * 60)
+    if len(files_written) > 0:
+        print(f"Failed functions saved to {len(files_written)} files:")
+        for fpath in files_written:
+            print(f"  {fpath}")
 
 
 def compute_nfw_scores(binned, fit_config, return_per_halo=False):
@@ -337,8 +253,10 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
                 binned['bin_positions'][halo_idx],
                 binned['rmin'][halo_idx],
                 binned['rmax'][halo_idx],
-                max_restarts=fit_config['max_restarts'],
-                nconv_required=fit_config['nconv_required'],
+                max_restarts=get_param_dependent_value(
+                    fit_config['max_restarts'], fitter.nfree),
+                nconv_required=get_param_dependent_value(
+                    fit_config['nconv_required'], fitter.nfree),
                 conv_rtol=fit_config['conv_rtol'],
                 Rs_lower_factor=fit_config.get('Rs_lower_factor'),
                 Rs_upper_factor=fit_config.get('Rs_upper_factor'),
@@ -348,6 +266,7 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
                 ftol=fit_config['ftol'],
                 maxeval=fit_config['maxeval'],
                 seed=42 + halo_idx,
+                optimizer=fit_config.get('optimizer', 'neldermead'),
             )
 
             if result['params'] is not None:
@@ -366,8 +285,8 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
 
     # Penalize for missing halos
     if n_success < nhalo:
-        median_score = total_score / n_success
-        total_score += (nhalo - n_success) * median_score
+        mean_score = total_score / n_success
+        total_score += (nhalo - n_success) * mean_score
 
     # Convert to per-halo average
     avg_score = total_score / nhalo
@@ -377,461 +296,499 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
     return avg_score
 
 
-def check_postfit_asymptotes(func_idx, expr_str, func_results, binned,
-                             fit_config, asymp_inf_threshold,
-                             asymp_zero_threshold, print_prefix=""):
+def setup_nfw_early_stop(fit_config, nfw_per_halo=None):
     """
-    Check post-fit asymptotes for a function.
+    Parse NFW early stop configuration and compute reference values.
+
+    Parameters
+    ----------
+    fit_config : dict
+        Fitting configuration dictionary.
+    nfw_per_halo : np.ndarray, optional
+        Per-halo NFW normalized losses. If None, early stopping is disabled.
+
+    Returns
+    -------
+    dict
+        Configuration dict with keys:
+        - 'enabled': bool, whether early stopping is active
+        - 'tiers': list of (n_halos, factor) tuples
+        - 'same_halos': bool, compare against same halos or all
+        - 'avg_all': float or None, NFW average over all halos
+    """
+    halos_list = fit_config.get('nfw_early_stop_halos', [])
+    factors_list = fit_config.get('nfw_early_stop_factors', [])
+    tiers = [(h, f) for h, f in zip(halos_list, factors_list) if h > 0]
+    same_halos = fit_config.get('nfw_early_stop_same_halos', True)
+
+    # Check if early stopping should be enabled
+    has_valid_nfw = (nfw_per_halo is not None
+                     and np.any(~np.isnan(nfw_per_halo)))
+    enabled = (fit_config.get('nfw_early_stop_enabled', False)
+               and has_valid_nfw
+               and len(tiers) > 0)
+
+    avg_all = np.nanmean(nfw_per_halo) if enabled else None
+
+    return {
+        'enabled': enabled,
+        'tiers': tiers,
+        'same_halos': same_halos,
+        'avg_all': avg_all,
+    }
+
+
+def fit_function_to_halos(func_idx, fitter, binned, fit_config,
+                          nfw_config, nfw_per_halo, log_prefix=""):
+    """
+    Fit a compiled function to all halos.
 
     Parameters
     ----------
     func_idx : int
-        Function index.
-    expr_str : str
-        Expression string.
-    func_results : list
-        List of (func_idx, halo_id, loss, params, converged, neval) tuples.
+        Function index for result tuples.
+    fitter : object
+        Compiled fitter from cdmprof.compile_fitter().
     binned : dict
-        Binned halo data.
+        Binned halo data with 'bin_counts', 'bin_positions', 'rmin', 'rmax'.
     fit_config : dict
-        Fitting configuration.
-    asymp_inf_threshold : float
-        Threshold for x->inf asymptote pass rate.
-    asymp_zero_threshold : float
-        Threshold for x->0+ asymptote pass rate.
-    print_prefix : str, optional
-        Prefix for verbose output (e.g., "Rank 0: ").
+        Fitting configuration dictionary.
+    nfw_config : dict
+        NFW early stop configuration from setup_nfw_early_stop().
+    nfw_per_halo : np.ndarray or None
+        Per-halo NFW normalized losses for comparison.
+    log_prefix : str, optional
+        Prefix for log messages (e.g., "Rank 0: ").
 
     Returns
     -------
-    tuple
-        (reject, n_pass_inf, n_pass_zero, n_checked)
+    dict
+        Results dict with keys:
+        - 'results': list of (func_idx, halo_idx, loss, params, converged,
+            neval)
+        - 'n_negative_loss': int, count of negative loss rejections
+        - 'early_stopped': bool, stopped due to consecutive failures
+        - 'nfw_early_stopped': bool, stopped due to NFW comparison
+        - 'nfw_avg': float or None, NFW average used in last comparison
     """
-    n_total = len(func_results)
-    round_dec = fit_config.get('asymp_round_decimals', 5)
-    asymp_timeout = fit_config.get('asymp_timeout', 0)
-    asymp_verbose = fit_config.get('asymp_verbose', False)
-    asymp_n_halos = fit_config.get('asymp_n_halos', 10)
+    nhalo = len(binned['halo_ids'])
+    early_stop_threshold = fit_config.get('early_stop_failures', 5)
 
-    # Sample halos if asymp_n_halos is set and less than total
-    if asymp_n_halos > 0 and asymp_n_halos < n_total:
-        rng = np.random.default_rng(seed=42)
-        sample_idx = rng.choice(n_total, size=asymp_n_halos, replace=False)
-        results_to_check = [func_results[i] for i in sorted(sample_idx)]
-    else:
-        results_to_check = func_results
+    func_results = []
+    func_norm_losses = []
+    n_negative_loss = 0
+    n_consecutive_failures = 0
+    early_stopped = False
+    nfw_early_stopped = False
+    nfw_avg = None
 
-    n_checked = len(results_to_check)
-    n_pass_inf = 0
-    n_pass_zero = 0
+    for halo_idx in range(nhalo):
+        try:
+            result = fitter.fit_with_restarts(
+                binned['bin_counts'][halo_idx],
+                binned['bin_positions'][halo_idx],
+                binned['rmin'][halo_idx],
+                binned['rmax'][halo_idx],
+                max_restarts=get_param_dependent_value(
+                    fit_config['max_restarts'], fitter.nfree),
+                nconv_required=get_param_dependent_value(
+                    fit_config['nconv_required'], fitter.nfree),
+                conv_rtol=fit_config['conv_rtol'],
+                conv_atol=fit_config.get('conv_atol', 10),
+                Rs_lower_factor=fit_config.get('Rs_lower_factor'),
+                Rs_upper_factor=fit_config.get('Rs_upper_factor'),
+                a_lower=fit_config.get('a_lower'),
+                a_upper=fit_config.get('a_upper'),
+                xtol=fit_config['xtol'],
+                ftol=fit_config['ftol'],
+                maxeval=fit_config['maxeval'],
+                seed=42 + halo_idx,
+                optimizer=fit_config.get('optimizer', 'neldermead'),
+            )
 
-    if asymp_verbose:
-        # Compute avg normalized loss (loss/npart) over all results
-        norm_losses = []
-        for r in func_results:
-            halo_id = r[1]
-            npart = np.sum(binned['bin_counts'][halo_id])
-            norm_losses.append(r[2] / npart)
-        avg_norm_loss = np.mean(norm_losses)
-        print(f"{print_prefix}func {func_idx} asymptote check "
-              f"(avg_loss/npart={avg_norm_loss:.4f}, "
-              f"n_check={n_checked}/{n_total}): {expr_str}", flush=True)
+            # Skip if fit failed (params is None)
+            if result['params'] is None:
+                if result.get('reject_reason') == 'negative_loss':
+                    n_negative_loss += 1
+                # Track consecutive failures for early stopping
+                if len(func_results) == 0:
+                    n_consecutive_failures += 1
+                    if n_consecutive_failures >= early_stop_threshold:
+                        early_stopped = True
+                        break
+                continue
 
-    for i_r, r in enumerate(results_to_check):
-        params = r[3]
-        halo_id = r[1]
-        if asymp_verbose:
-            print(f"  {print_prefix}halo {i_r+1}/{n_checked} "
-                  f"(id={halo_id}) fit done", flush=True)
-            print(f"    params={params}", flush=True)
-        lim_zero, lim_inf = cdmprof.compute_asymptotes_with_params(
-            expr_str, params, round_decimals=round_dec, timeout=asymp_timeout)
-        if asymp_verbose:
-            print(f"    limit done: x->0+={lim_zero}, x->inf={lim_inf}",
-                  flush=True)
+            # Reset consecutive failures on success
+            n_consecutive_failures = 0
 
-        if cdmprof.fitting.check_asymptote_inf(lim_inf):
-            n_pass_inf += 1
-        if cdmprof.fitting.check_asymptote_zero(lim_zero):
-            n_pass_zero += 1
+            # Compute normalized loss for this halo
+            npart = np.sum(binned['bin_counts'][halo_idx])
+            norm_loss = result['loss'] / npart
+            func_norm_losses.append(norm_loss)
 
-    # Check thresholds
-    reject = False
-    frac_pass_inf = n_pass_inf / n_checked
-    if frac_pass_inf < asymp_inf_threshold:
-        reject = True
-    frac_pass_zero = n_pass_zero / n_checked
-    if frac_pass_zero < asymp_zero_threshold:
-        reject = True
+            func_results.append((
+                func_idx,
+                halo_idx,
+                result['loss'],
+                result['params'],
+                result['converged'],
+                result['neval'],
+            ))
 
-    return reject, n_pass_inf, n_pass_zero, n_checked
+            # NFW comparison early stopping (multi-tier)
+            if nfw_config['enabled']:
+                n_fitted = len(func_results)
+                func_avg = np.mean(func_norm_losses)
+                # Compare against same halos or all halos
+                if nfw_config['same_halos']:
+                    nfw_avg = np.nanmean(nfw_per_halo[:halo_idx + 1])
+                else:
+                    nfw_avg = nfw_config['avg_all']
+                for tier_halos, tier_factor in nfw_config['tiers']:
+                    if (n_fitted >= tier_halos and
+                            func_avg > nfw_avg + tier_factor):
+                        nfw_early_stopped = True
+                        break
+                if nfw_early_stopped:
+                    break
+
+        except Exception as e:
+            print(f"{log_prefix}func {func_idx}, halo {halo_idx} "
+                  f"failed: {e}", flush=True)
+            # Track consecutive failures for early stopping
+            if len(func_results) == 0:
+                n_consecutive_failures += 1
+                if n_consecutive_failures >= early_stop_threshold:
+                    early_stopped = True
+                    break
+
+    return {
+        'results': func_results,
+        'n_negative_loss': n_negative_loss,
+        'early_stopped': early_stopped,
+        'nfw_early_stopped': nfw_early_stopped,
+        'nfw_avg': nfw_avg,
+    }
 
 
-def print_best_results(output_path, equations, npart_per_halo,
-                       asymp_postfit_funcs=None, nfw_score=None, n_top=100):
+class ResultsFile:
     """
-    Print a table of the best functions ranked by normalized loss.
+    HDF5 results file handler for fit results.
 
-    Score = sum over halos of (loss / npart), lower is better.
-    Functions that fail on some halos are penalized by adding
-    n_missing * median(loss/npart) to their score.
-
-    Parameters
-    ----------
-    output_path : Path
-        Path to merged HDF5 results file.
-    equations : list of str
-        List of equation strings.
-    npart_per_halo : array-like
-        Number of particles per halo.
-    asymp_postfit_funcs : set, optional
-        Set of func_idx that had post-fit asymptote validation.
-    nfw_score : float, optional
-        NFW reference score for comparison.
-    n_top : int, optional
-        Number of top functions to display.
+    Provides methods for reading, writing, appending, and merging results.
     """
-    output_path = Path(output_path)
-    if not output_path.exists():
-        print("No results file found for ranking.")
-        return
 
-    if asymp_postfit_funcs is None:
-        asymp_postfit_funcs = set()
+    # Core result dataset names
+    RESULT_FIELDS = ['func_idx', 'halo_idx', 'loss', 'params',
+                     'converged', 'neval']
+    # Asymptote pass fraction field names
+    ASYMP_PASS_FIELDS = ['asymp_pass_func_idx', 'asymp_pass_inf',
+                         'asymp_pass_zero', 'asymp_pass_total']
 
-    with h5py.File(output_path, 'r') as f:
-        func_idx = f['func_idx'][:]
-        halo_idx = f['halo_idx'][:]
-        loss = f['loss'][:]
+    def __init__(self, path):
+        self.path = Path(path)
 
-        # Load asymptote pass fractions if available
-        asymp_pass_dict = {}  # func_idx -> (n_pass_inf, n_pass_zero, n_total)
-        if 'asymp_pass_func_idx' in f:
-            apf_idx = f['asymp_pass_func_idx'][:]
-            apf_inf = f['asymp_pass_inf'][:]
-            apf_zero = f['asymp_pass_zero'][:]
-            apf_total = f['asymp_pass_total'][:]
-            for i, fidx in enumerate(apf_idx):
-                asymp_pass_dict[int(fidx)] = (
-                    int(apf_inf[i]), int(apf_zero[i]), int(apf_total[i]))
+    def exists(self):
+        return self.path.exists()
 
-    # Compute normalized loss per result
-    npart_per_halo = np.asarray(npart_per_halo)
-    n_halos_total = len(npart_per_halo)
-    normalized_loss = loss / npart_per_halo[halo_idx]
+    # -------------------------------------------------------------------------
+    # Helper methods for reading/writing
+    # -------------------------------------------------------------------------
 
-    # Compute score per function: average of normalized losses across halos
-    # Penalize functions that fail on some halos
-    unique_funcs = np.unique(func_idx)
-    scores = []
+    @staticmethod
+    def _read_index_set(f, name):
+        """Read an index set from HDF5 file."""
+        if name in f:
+            return set(f[name][:].tolist())
+        return set()
 
-    for fidx in unique_funcs:
-        mask = func_idx == fidx
-        norm_losses = normalized_loss[mask]
-        n_halos_fitted = len(norm_losses)
-        n_missing = n_halos_total - n_halos_fitted
+    @staticmethod
+    def _write_index_set(f, name, data):
+        """Write an index set to HDF5 file (replaces existing)."""
+        if name in f:
+            del f[name]
+        if data:
+            arr = np.array(sorted(data), dtype=np.int32)
+            f.create_dataset(name, data=arr)
 
-        # Base score: sum of normalized losses
-        total_score = np.sum(norm_losses)
+    @staticmethod
+    def _read_asymp_pass(f):
+        """Read asymptote pass fractions -> dict."""
+        if 'asymp_pass_func_idx' not in f:
+            return {}
+        idx = f['asymp_pass_func_idx'][:]
+        inf = f['asymp_pass_inf'][:]
+        zero = f['asymp_pass_zero'][:]
+        total = f['asymp_pass_total'][:]
+        return {int(idx[i]): (int(inf[i]), int(zero[i]), int(total[i]))
+                for i in range(len(idx))}
 
-        # Penalty for missing halos: add n_missing * median
-        if n_missing > 0 and n_halos_fitted > 0:
-            median_loss = np.median(norm_losses)
-            total_score += n_missing * median_loss
+    @staticmethod
+    def _write_asymp_pass(f, data):
+        """Write asymptote pass fractions from dict (replaces existing)."""
+        for name in ResultsFile.ASYMP_PASS_FIELDS:
+            if name in f:
+                del f[name]
+        if not data:
+            return
+        n = len(data)
+        idx = np.zeros(n, dtype=np.int32)
+        inf = np.zeros(n, dtype=np.int32)
+        zero = np.zeros(n, dtype=np.int32)
+        total = np.zeros(n, dtype=np.int32)
+        items = sorted(data.items())
+        for i, (fidx, (n_inf, n_zero, n_tot)) in enumerate(items):
+            idx[i], inf[i], zero[i], total[i] = fidx, n_inf, n_zero, n_tot
+        f.create_dataset('asymp_pass_func_idx', data=idx)
+        f.create_dataset('asymp_pass_inf', data=inf)
+        f.create_dataset('asymp_pass_zero', data=zero)
+        f.create_dataset('asymp_pass_total', data=total)
 
-        # Convert to per-halo average
-        avg_score = total_score / n_halos_total
+    # -------------------------------------------------------------------------
+    # Public methods
+    # -------------------------------------------------------------------------
 
-        scores.append((fidx, avg_score, n_halos_fitted))
+    def append(self, new_results, equations, negative_loss_func_idx=None,
+               processed_func_idx=None, nfw_score=None):
+        """
+        Append fit results to file, creating it if needed.
 
-    # Sort by score (lower is better)
-    scores.sort(key=lambda x: x[1])
+        Parameters
+        ----------
+        new_results : list of tuples
+            Each tuple: (func_idx, halo_idx, loss, params, converged, neval)
+        equations : list of str
+            Equation strings (written once on creation).
+        negative_loss_func_idx : set, optional
+            Functions rejected due to negative loss.
+        processed_func_idx : set, optional
+            All attempted function indices.
+        nfw_score : float, optional
+            NFW reference score.
+        """
+        negative_loss_func_idx = negative_loss_func_idx or set()
+        processed_func_idx = processed_func_idx or set()
 
-    # Print NFW reference score
-    if nfw_score is not None:
-        print("\n" + "-" * 79)
-        print(f"NFW REFERENCE: AvgScore = {nfw_score:.4f}  "
-              f"(rho = 1 / (x * (1 + x)^2))")
-        print("-" * 79)
+        no_data = (len(new_results) == 0 and not negative_loss_func_idx
+                   and not processed_func_idx)
+        if no_data and not self.exists():
+            return
 
-    # Print table
-    print("\n" + "=" * 79)
-    print("TOP FUNCTIONS (ranked by avg loss/npart per halo, lower is better)")
-    print("=" * 79)
-    header = f"{'Rank':<6} {'Func#':<8} {'AvgScore':<12} {'#Halos':<8} "
-    header += f"{'Asymp':<8} Equation"
-    print(header)
-    print("-" * 79)
-
-    for rank, (fidx, score, n_halos) in enumerate(scores[:n_top], 1):
-        eq = equations[fidx]
-        # Truncate equation if too long
-        if len(eq) > 35:
-            eq = eq[:32] + "..."
-        # Asymptote check status: show pass fraction if available
-        if fidx in asymp_pass_dict:
-            n_inf, n_zero, n_total = asymp_pass_dict[fidx]
-            if n_total > 0:
-                frac_inf = n_inf / n_total
-                frac_zero = n_zero / n_total
-                asymp_status = f"{100*frac_inf:.0f}/{100*frac_zero:.0f}"
-            else:
-                asymp_status = "-"
-        elif fidx in asymp_postfit_funcs:
-            asymp_status = "?"
-        else:
-            asymp_status = "-"
-        row = f"{rank:<6} {fidx:<8} {score:<12.4f} {n_halos:<8} "
-        row += f"{asymp_status:<8} {eq}"
-        print(row)
-
-    print("=" * 79)
-    print(f"Showing top {min(n_top, len(scores))} of {len(scores)} functions")
-    print("(Scores penalized for missing halos: n_missing * median)")
-    print("(Asymp: inf%/zero% pass fractions for x->inf and x->0+ checks)")
-    print("")
-
-
-def merge_results(input_dir, output_path, delete_rank_files=True):
-    """
-    Merge all results_rank*.hdf5 files into a single output file.
-
-    Parameters
-    ----------
-    input_dir : Path
-        Directory containing results_rank*.hdf5 files.
-    output_path : Path
-        Output file path.
-    delete_rank_files : bool, optional
-        If True, delete input files after merging.
-
-    Returns
-    -------
-    int
-        Total number of results merged.
-    """
-    input_dir = Path(input_dir)
-    output_path = Path(output_path)
-
-    rank_files = sorted(input_dir.glob("results_rank*.hdf5"))
-
-    if len(rank_files) == 0:
-        print(f"No results_rank*.hdf5 files found in {input_dir}")
-        return 0
-
-    print(f"Merging {len(rank_files)} rank files...", flush=True)
-
-    all_func_idx = []
-    all_halo_idx = []
-    all_loss = []
-    all_params = []
-    all_converged = []
-    all_neval = []
-    all_negative_loss_func_idx = set()
-    all_asymp_reject_func_idx = set()
-    all_asymp_pass_fractions = {}  # func_idx -> (n_inf, n_zero, n_total)
-    equations = None
-
-    for fpath in rank_files:
-        with h5py.File(fpath, 'r') as f:
-            if 'func_idx' in f:
-                all_func_idx.append(f['func_idx'][:])
-                all_halo_idx.append(f['halo_idx'][:])
-                all_loss.append(f['loss'][:])
-                all_params.append(f['params'][:])
-                all_converged.append(f['converged'][:])
-                all_neval.append(f['neval'][:])
-
-            if equations is None and 'equations' in f:
-                equations = f['equations'][:]
-
-            # Collect negative loss func indices
-            if 'negative_loss_func_idx' in f:
-                all_negative_loss_func_idx.update(
-                    f['negative_loss_func_idx'][:].tolist())
-
-            # Collect asymptote rejection func indices
-            if 'asymp_reject_func_idx' in f:
-                all_asymp_reject_func_idx.update(
-                    f['asymp_reject_func_idx'][:].tolist())
-
-            # Collect asymptote pass fractions
-            if 'asymp_pass_func_idx' in f:
-                apf_idx = f['asymp_pass_func_idx'][:]
-                apf_inf = f['asymp_pass_inf'][:]
-                apf_zero = f['asymp_pass_zero'][:]
-                apf_total = f['asymp_pass_total'][:]
-                for i, fidx in enumerate(apf_idx):
-                    all_asymp_pass_fractions[int(fidx)] = (
-                        int(apf_inf[i]), int(apf_zero[i]), int(apf_total[i]))
-
-    if len(all_func_idx) == 0:
-        print("No data to merge")
-        return 0
-
-    func_idx = np.concatenate(all_func_idx)
-    halo_idx = np.concatenate(all_halo_idx)
-    loss = np.concatenate(all_loss)
-    converged = np.concatenate(all_converged)
-    neval = np.concatenate(all_neval)
-
-    # Pad params arrays to same size before concatenating
-    max_nparams = max(p.shape[1] for p in all_params)
-    padded_params = []
-    for p in all_params:
-        if p.shape[1] < max_nparams:
-            pad_width = ((0, 0), (0, max_nparams - p.shape[1]))
-            p = np.pad(p, pad_width, constant_values=np.nan)
-        padded_params.append(p)
-    params = np.concatenate(padded_params)
-
-    n_total = len(func_idx)
-    n_funcs = len(np.unique(func_idx))
-    n_halos = len(np.unique(halo_idx))
-
-    with h5py.File(output_path, 'w') as f:
-        f.create_dataset('func_idx', data=func_idx)
-        f.create_dataset('halo_idx', data=halo_idx)
-        f.create_dataset('loss', data=loss)
-        f.create_dataset('params', data=params)
-        f.create_dataset('converged', data=converged)
-        f.create_dataset('neval', data=neval)
-
-        if equations is not None:
-            dt = h5py.special_dtype(vlen=str)
-            f.create_dataset('equations', data=equations, dtype=dt)
-
-        # Store negative loss function indices
-        if len(all_negative_loss_func_idx) > 0:
-            neg_idx = np.array(sorted(all_negative_loss_func_idx),
-                               dtype=np.int32)
-            f.create_dataset('negative_loss_func_idx', data=neg_idx)
-
-        # Store asymptote rejection function indices
-        if len(all_asymp_reject_func_idx) > 0:
-            asymp_idx = np.array(sorted(all_asymp_reject_func_idx),
-                                 dtype=np.int32)
-            f.create_dataset('asymp_reject_func_idx', data=asymp_idx)
-
-        # Store asymptote pass fractions
-        if len(all_asymp_pass_fractions) > 0:
-            n_apf = len(all_asymp_pass_fractions)
-            apf_func_idx = np.zeros(n_apf, dtype=np.int32)
-            apf_pass_inf = np.zeros(n_apf, dtype=np.int32)
-            apf_pass_zero = np.zeros(n_apf, dtype=np.int32)
-            apf_total = np.zeros(n_apf, dtype=np.int32)
-            for i, (fidx, (n_inf, n_zero, n_tot)) in enumerate(
-                    sorted(all_asymp_pass_fractions.items())):
-                apf_func_idx[i] = fidx
-                apf_pass_inf[i] = n_inf
-                apf_pass_zero[i] = n_zero
-                apf_total[i] = n_tot
-            f.create_dataset('asymp_pass_func_idx', data=apf_func_idx)
-            f.create_dataset('asymp_pass_inf', data=apf_pass_inf)
-            f.create_dataset('asymp_pass_zero', data=apf_pass_zero)
-            f.create_dataset('asymp_pass_total', data=apf_total)
-
-        f.attrs['n_results'] = n_total
-        f.attrs['n_functions'] = n_funcs
-        f.attrs['n_halos'] = n_halos
-
-    print(f"Merged {n_total} results ({n_funcs} functions, {n_halos} halos)",
-          flush=True)
-    if len(all_negative_loss_func_idx) > 0:
-        print(f"  {len(all_negative_loss_func_idx)} functions rejected "
-              f"(negative loss)", flush=True)
-    if len(all_asymp_reject_func_idx) > 0:
-        print(f"  {len(all_asymp_reject_func_idx)} functions rejected "
-              f"(asymptote validation)", flush=True)
-    print(f"Wrote merged results to {output_path}", flush=True)
-
-    if delete_rank_files:
-        for fpath in rank_files:
-            fpath.unlink()
-
-    return n_total
-
-
-def write_results(fpath, results, equations, negative_loss_func_idx=None,
-                  asymp_reject_func_idx=None, asymp_pass_fractions=None):
-    """
-    Write fit results to HDF5 file.
-
-    Parameters
-    ----------
-    fpath : str or Path
-        Output file path.
-    results : list of tuples
-        Each tuple: (func_idx, halo_idx, loss, params, converged, neval)
-    equations : list of str
-        Equation strings for reference.
-    negative_loss_func_idx : set or list, optional
-        Function indices that were rejected due to negative loss.
-    asymp_reject_func_idx : set or list, optional
-        Function indices that were rejected due to asymptote validation.
-    asymp_pass_fractions : dict, optional
-        func_idx -> (n_pass_inf, n_pass_zero, n_total) for post-fit
-        asymptote checks.
-    """
-    no_data = (len(results) == 0 and not negative_loss_func_idx
-               and not asymp_reject_func_idx)
-    if no_data:
-        return
-
-    with h5py.File(fpath, 'w') as f:
-        if len(results) > 0:
-            func_idx = np.array([r[0] for r in results], dtype=np.int32)
-            halo_idx = np.array([r[1] for r in results], dtype=np.int32)
-            loss = np.array([r[2] for r in results], dtype=np.float64)
-            converged = np.array([r[4] for r in results], dtype=np.int32)
-            neval = np.array([r[5] for r in results], dtype=np.int32)
-
-            # Pad params to fixed size (max nparams across all results)
-            max_nparams = max(len(r[3]) for r in results)
-            params = np.full((len(results), max_nparams), np.nan,
+        # Prepare result arrays
+        if len(new_results) > 0:
+            arrays = {
+                'func_idx': np.array([r[0] for r in new_results], np.int32),
+                'halo_idx': np.array([r[1] for r in new_results], np.int32),
+                'loss': np.array([r[2] for r in new_results], np.float64),
+                'converged': np.array([r[4] for r in new_results], np.int32),
+                'neval': np.array([r[5] for r in new_results], np.int32),
+            }
+            # Pad params to fixed size
+            params = np.full((len(new_results), MAX_NPARAMS), np.nan,
                              dtype=np.float64)
-            for i, r in enumerate(results):
-                params[i, :len(r[3])] = r[3]
+            for i, r in enumerate(new_results):
+                n = min(len(r[3]), MAX_NPARAMS)
+                params[i, :n] = r[3][:n]
+            arrays['params'] = params
 
-            f.create_dataset('func_idx', data=func_idx)
-            f.create_dataset('halo_idx', data=halo_idx)
-            f.create_dataset('loss', data=loss)
-            f.create_dataset('params', data=params)
-            f.create_dataset('converged', data=converged)
-            f.create_dataset('neval', data=neval)
+        mode = 'a' if self.exists() else 'w'
+        with h5py.File(self.path, mode) as f:
+            # Append/create result datasets
+            if len(new_results) > 0:
+                if 'func_idx' in f:
+                    for name, data in arrays.items():
+                        dset = f[name]
+                        old_size = dset.shape[0]
+                        dset.resize(old_size + len(data), axis=0)
+                        dset[old_size:] = data
+                else:
+                    for name, data in arrays.items():
+                        maxshape = (None, MAX_NPARAMS) if name == 'params' \
+                            else (None,)
+                        f.create_dataset(name, data=data, maxshape=maxshape,
+                                         chunks=True)
 
-        # Store equations as variable-length strings
-        dt = h5py.special_dtype(vlen=str)
-        eq_data = np.array(equations, dtype=object)
-        f.create_dataset('equations', data=eq_data, dtype=dt)
+            # Write equations once
+            if 'equations' not in f:
+                dt = h5py.special_dtype(vlen=str)
+                f.create_dataset('equations', data=np.array(equations,
+                                 dtype=object), dtype=dt)
 
-        # Store negative loss function indices
-        if negative_loss_func_idx:
-            neg_idx = np.array(sorted(negative_loss_func_idx), dtype=np.int32)
-            f.create_dataset('negative_loss_func_idx', data=neg_idx)
+            # Merge and write metadata
+            merged_neg = self._read_index_set(f, 'negative_loss_func_idx')
+            merged_neg |= negative_loss_func_idx
+            self._write_index_set(f, 'negative_loss_func_idx', merged_neg)
 
-        # Store asymptote rejection function indices
-        if asymp_reject_func_idx:
-            asymp_idx = np.array(sorted(asymp_reject_func_idx), dtype=np.int32)
-            f.create_dataset('asymp_reject_func_idx', data=asymp_idx)
+            merged_proc = self._read_index_set(f, 'processed_func_idx')
+            merged_proc |= processed_func_idx
+            self._write_index_set(f, 'processed_func_idx', merged_proc)
 
-        # Store asymptote pass fractions
-        if asymp_pass_fractions:
-            n_funcs = len(asymp_pass_fractions)
-            apf_func_idx = np.zeros(n_funcs, dtype=np.int32)
-            apf_pass_inf = np.zeros(n_funcs, dtype=np.int32)
-            apf_pass_zero = np.zeros(n_funcs, dtype=np.int32)
-            apf_total = np.zeros(n_funcs, dtype=np.int32)
-            for i, (fidx, (n_inf, n_zero, n_tot)) in enumerate(
-                    sorted(asymp_pass_fractions.items())):
-                apf_func_idx[i] = fidx
-                apf_pass_inf[i] = n_inf
-                apf_pass_zero[i] = n_zero
-                apf_total[i] = n_tot
-            f.create_dataset('asymp_pass_func_idx', data=apf_func_idx)
-            f.create_dataset('asymp_pass_inf', data=apf_pass_inf)
-            f.create_dataset('asymp_pass_zero', data=apf_pass_zero)
-            f.create_dataset('asymp_pass_total', data=apf_total)
+            if nfw_score is not None:
+                f.attrs['nfw_score'] = nfw_score
+
+    @classmethod
+    def merge(cls, input_dir, output_path, delete_rank_files=True,
+              append_to_existing=False, npart_per_halo=None):
+        """
+        Merge results_rank*.hdf5 files into a single output file.
+
+        Parameters
+        ----------
+        input_dir : Path
+            Directory containing results_rank*.hdf5 files.
+        output_path : Path
+            Output file path.
+        delete_rank_files : bool
+            Delete input files after merging.
+        append_to_existing : bool
+            Append to existing output file.
+        npart_per_halo : array-like, optional
+            If provided, clear params for functions worse than NFW.
+
+        Returns
+        -------
+        int
+            Total number of results merged.
+        """
+        input_dir = Path(input_dir)
+        output_path = Path(output_path)
+
+        rank_files = sorted(input_dir.glob("results_rank*.hdf5"))
+        if not rank_files:
+            print(f"No results_rank*.hdf5 files found in {input_dir}")
+            return 0
+
+        print(f"Merging {len(rank_files)} rank files...", flush=True)
+
+        # Collect all data
+        all_results = {name: [] for name in cls.RESULT_FIELDS}
+        all_neg_loss = set()
+        all_asymp_reject = set()
+        all_asymp_pass = {}
+        all_processed = set()
+        nfw_score = None
+        equations = None
+
+        # Source files: existing output (if appending) + rank files
+        source_files = []
+        if append_to_existing and output_path.exists():
+            print(f"Appending to existing output: {output_path}", flush=True)
+            source_files.append(output_path)
+        source_files.extend(rank_files)
+
+        for fpath in source_files:
+            with h5py.File(fpath, 'r') as f:
+                # Read result arrays
+                if 'func_idx' in f:
+                    for name in cls.RESULT_FIELDS:
+                        all_results[name].append(f[name][:])
+
+                # Read equations (first found)
+                if equations is None and 'equations' in f:
+                    equations = f['equations'][:]
+
+                # Read metadata
+                all_neg_loss |= cls._read_index_set(
+                    f, 'negative_loss_func_idx')
+                all_asymp_reject |= cls._read_index_set(
+                    f, 'asymp_reject_func_idx')
+                all_asymp_pass.update(cls._read_asymp_pass(f))
+                all_processed |= cls._read_index_set(
+                    f, 'processed_func_idx')
+
+                if nfw_score is None and 'nfw_score' in f.attrs:
+                    nfw_score = f.attrs['nfw_score']
+
+        if not all_results['func_idx'] and not all_processed:
+            print("No data to merge")
+            return 0
+
+        # Concatenate results
+        has_results = len(all_results['func_idx']) > 0
+        if has_results:
+            # Pad params arrays to same width
+            max_ncols = max(p.shape[1] for p in all_results['params'])
+            padded = []
+            for p in all_results['params']:
+                if p.shape[1] < max_ncols:
+                    p = np.pad(p, ((0, 0), (0, max_ncols - p.shape[1])),
+                               constant_values=np.nan)
+                padded.append(p)
+            all_results['params'] = padded
+
+            merged = {name: np.concatenate(all_results[name])
+                      for name in cls.RESULT_FIELDS}
+
+            n_total = len(merged['func_idx'])
+            n_funcs = len(np.unique(merged['func_idx']))
+            n_halos = len(np.unique(merged['halo_idx']))
+
+            # Filter params for functions worse than NFW
+            if npart_per_halo is not None and nfw_score is not None:
+                npart = np.asarray(npart_per_halo)
+                norm_loss = merged['loss'] / npart[merged['halo_idx']]
+                unique_f, inv, counts = np.unique(
+                    merged['func_idx'], return_inverse=True,
+                    return_counts=True)
+                sums = np.bincount(inv, weights=norm_loss)
+                means = sums / counts
+                n_miss = len(npart) - counts
+                penalty = np.where(n_miss > 0, n_miss * means, 0.0)
+                scores = (sums + penalty) / len(npart)
+
+                good = set(unique_f[scores <= nfw_score])
+                n_bad = len(unique_f) - len(good)
+                print(f"Params filter: {len(good)} functions <= NFW, "
+                      f"{n_bad} functions > NFW (params cleared)", flush=True)
+                bad_mask = ~np.isin(merged['func_idx'], list(good))
+                merged['params'][bad_mask] = np.nan
+        else:
+            merged = None
+            n_total = n_funcs = n_halos = 0
+
+        # Write output
+        with h5py.File(output_path, 'w') as f:
+            if has_results:
+                for name in cls.RESULT_FIELDS:
+                    if name == 'params':
+                        f.create_dataset(
+                            name, data=merged[name],
+                            compression='gzip', compression_opts=4)
+                    else:
+                        f.create_dataset(name, data=merged[name])
+
+            if equations is not None:
+                dt = h5py.special_dtype(vlen=str)
+                f.create_dataset('equations', data=equations, dtype=dt)
+
+            cls._write_index_set(f, 'negative_loss_func_idx', all_neg_loss)
+            cls._write_index_set(f, 'asymp_reject_func_idx', all_asymp_reject)
+            cls._write_asymp_pass(f, all_asymp_pass)
+            cls._write_index_set(f, 'processed_func_idx', all_processed)
+
+            if nfw_score is not None:
+                f.attrs['nfw_score'] = nfw_score
+            f.attrs['n_results'] = n_total
+            f.attrs['n_functions'] = n_funcs
+            f.attrs['n_halos'] = n_halos
+
+        # Print summary
+        n_proc = len(all_processed)
+        print(f"Merged {n_total} results ({n_funcs} functions, "
+              f"{n_halos} halos, {n_proc} processed)", flush=True)
+        if all_neg_loss:
+            print(f"  {len(all_neg_loss)} functions rejected (negative loss)",
+                  flush=True)
+        if all_asymp_reject:
+            print(f"  {len(all_asymp_reject)} functions rejected "
+                  f"(asymptote validation)", flush=True)
+        print(f"Wrote merged results to {output_path}", flush=True)
+
+        if delete_rank_files:
+            for fpath in rank_files:
+                fpath.unlink()
+
+        return n_total
 
 
 def master_loop(comm, job_queue, batch_size):
@@ -854,8 +811,9 @@ def master_loop(comm, job_queue, batch_size):
     n_total = len(job_queue)
     workers_done = 0
 
-    print(f"Master: {n_total} functions to process, {n_workers} workers, "
-          f"batch size {batch_size}", flush=True)
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] Master: {n_total} functions to process, "
+          f"{n_workers} workers, batch size {batch_size}", flush=True)
 
     while workers_done < n_workers:
         # Wait for any worker to request work
@@ -863,24 +821,25 @@ def master_loop(comm, job_queue, batch_size):
         worker_rank = comm.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG,
                                 status=status)
 
+        now = datetime.now().strftime("%H:%M:%S")
         if len(job_queue) > 0:
             # Send next batch
             batch = job_queue[:batch_size]
             job_queue = job_queue[batch_size:]
             comm.send(batch, dest=worker_rank, tag=WORK_TAG)
-            print(f"Master: sent {len(batch)} jobs to rank {worker_rank}, "
-                  f"{len(job_queue)} remaining", flush=True)
+            print(f"[{now}] Master: sent {len(batch)} jobs to "
+                  f"rank {worker_rank}, {len(job_queue)} remaining",
+                  flush=True)
         else:
             # No more work, tell worker to finish
             comm.send(None, dest=worker_rank, tag=DONE_TAG)
             workers_done += 1
-            print(f"Master: rank {worker_rank} done, "
+            print(f"[{now}] Master: rank {worker_rank} done, "
                   f"{n_workers - workers_done} workers remaining", flush=True)
 
 
 def worker_loop(comm, equations, binned, output_dir, fit_config,
-                asymp_inf_param_dep, asymp_zero_param_dep, asymp_unknown,
-                nfw_per_halo=None):
+                nfw_per_halo=None, nfw_score=None):
     """
     Worker process: request work, fit functions, save results.
 
@@ -896,36 +855,28 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
         Output directory.
     fit_config : dict
         Fitting configuration parameters.
-    asymp_inf_param_dep : dict
-        func_idx -> limit_expr for x->inf param-dependent asymptotes.
-    asymp_zero_param_dep : dict
-        func_idx -> limit_expr for x->0+ param-dependent asymptotes.
-    asymp_unknown : set
-        func_idx for functions needing post-fit asymptote computation.
     nfw_per_halo : np.ndarray, optional
         Per-halo NFW normalized losses for early stopping comparison.
+    nfw_score : float, optional
+        NFW reference score.
     """
     rank = comm.Get_rank()
-    results = []
+    output_path = output_dir / f"results_rank{rank}.hdf5"
+
+    # Buffer for results - cleared after each write
+    results_buffer = []
+    total_results_written = 0
+
     negative_loss_func_idx = set()
-    asymp_reject_func_idx = set()
-    # Track pass fractions: func_idx -> (n_pass_inf, n_pass_zero, n_total)
-    asymp_pass_fractions = {}
+    processed_func_idx = set()  # Track all attempted functions
 
-    nhalo = len(binned['halo_ids'])
-    asymp_inf_threshold = fit_config.get('asymp_inf_threshold', 0.5)
-    asymp_zero_threshold = fit_config.get('asymp_zero_threshold', 0.5)
+    # Timing tracking
+    total_fit_time = 0.0
+    t_worker_start = time()
 
-    # NFW comparison settings
-    nfw_early_stop_halos = fit_config.get('nfw_early_stop_halos', 5)
-    nfw_early_stop_factor = fit_config.get('nfw_early_stop_factor', 2.0)
-    use_nfw_early_stop = (fit_config.get('nfw_early_stop_enabled', False)
-                          and nfw_per_halo is not None
-                          and np.any(~np.isnan(nfw_per_halo)))
-    if use_nfw_early_stop:
-        nfw_avg = np.nanmean(nfw_per_halo)
-    else:
-        nfw_avg = None
+    # NFW comparison settings (multi-tier early stopping)
+    nfw_config = setup_nfw_early_stop(fit_config, nfw_per_halo)
+    early_stop_threshold = fit_config.get('early_stop_failures', 5)
 
     while True:
         # Request work from master
@@ -945,6 +896,9 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
         for func_idx in batch:
             expr_str = equations[func_idx]
 
+            # Mark as processed regardless of outcome
+            processed_func_idx.add(func_idx)
+
             # Skip bad functions silently
             if cdmprof.fitting.is_bad_function(expr_str):
                 continue
@@ -956,100 +910,33 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
                       f"'{expr_str}': {e}", flush=True)
                 continue
 
-            # Fit to all halos, collecting results temporarily
-            func_results = []
-            func_norm_losses = []  # Track normalized losses for NFW comparison
-            n_negative_loss = 0
-            n_consecutive_failures = 0
-            early_stop_threshold = fit_config.get('early_stop_failures', 5)
-            early_stopped = False
-            nfw_early_stopped = False
+            # Fit to all halos
+            t_fit_start = time()
+            fit_result = fit_function_to_halos(
+                func_idx, fitter, binned, fit_config,
+                nfw_config, nfw_per_halo, log_prefix=f"Rank {rank}: ")
+            total_fit_time += time() - t_fit_start
 
-            for halo_idx in range(nhalo):
-                try:
-                    result = fitter.fit_with_restarts(
-                        binned['bin_counts'][halo_idx],
-                        binned['bin_positions'][halo_idx],
-                        binned['rmin'][halo_idx],
-                        binned['rmax'][halo_idx],
-                        max_restarts=fit_config['max_restarts'],
-                        nconv_required=fit_config['nconv_required'],
-                        conv_rtol=fit_config['conv_rtol'],
-                        Rs_lower_factor=fit_config.get('Rs_lower_factor'),
-                        Rs_upper_factor=fit_config.get('Rs_upper_factor'),
-                        a_lower=fit_config.get('a_lower'),
-                        a_upper=fit_config.get('a_upper'),
-                        xtol=fit_config['xtol'],
-                        ftol=fit_config['ftol'],
-                        maxeval=fit_config['maxeval'],
-                        seed=42 + halo_idx,
-                    )
-
-                    # Skip if fit failed (params is None)
-                    if result['params'] is None:
-                        if result.get('reject_reason') == 'negative_loss':
-                            n_negative_loss += 1
-                        # Track consecutive failures for early stopping
-                        if len(func_results) == 0:
-                            n_consecutive_failures += 1
-                            if n_consecutive_failures >= early_stop_threshold:
-                                early_stopped = True
-                                break
-                        continue
-
-                    # Reset consecutive failures on success
-                    n_consecutive_failures = 0
-
-                    # Compute normalized loss for this halo
-                    npart = np.sum(binned['bin_counts'][halo_idx])
-                    norm_loss = result['loss'] / npart
-                    func_norm_losses.append(norm_loss)
-
-                    func_results.append((
-                        func_idx,
-                        halo_idx,
-                        result['loss'],
-                        result['params'],
-                        result['converged'],
-                        result['neval'],
-                    ))
-
-                    # NFW comparison early stopping
-                    if (use_nfw_early_stop and
-                            len(func_results) >= nfw_early_stop_halos):
-                        func_avg = np.mean(func_norm_losses)
-                        if func_avg > nfw_avg + nfw_early_stop_factor:
-                            nfw_early_stopped = True
-                            break
-
-                except Exception as e:
-                    print(f"Rank {rank}: func {func_idx}, halo {halo_idx} "
-                          f"failed: {e}", flush=True)
-                    # Track consecutive failures for early stopping
-                    if len(func_results) == 0:
-                        n_consecutive_failures += 1
-                        if n_consecutive_failures >= early_stop_threshold:
-                            early_stopped = True
-                            break
-
-            if early_stopped:
+            # Handle early stopping
+            if fit_result['early_stopped']:
                 print(f"Rank {rank}: func {func_idx} early stopped after "
                       f"{early_stop_threshold} failures", flush=True)
                 continue
 
-            if nfw_early_stopped:
-                # Skip function entirely (don't save partial results)
-                func_avg = np.mean(func_norm_losses)
-                threshold = nfw_avg + nfw_early_stop_factor
+            if fit_result['nfw_early_stopped']:
+                n_fitted = len(fit_result['results'])
+                func_avg = np.mean([r[2] / np.sum(binned['bin_counts'][r[1]])
+                                    for r in fit_result['results']])
                 print(f"Rank {rank}: NFW early stopped '{expr_str}' "
-                      f"(avg={func_avg:.4f} > {threshold:.4f})", flush=True)
+                      f"(n={n_fitted}, avg={func_avg:.4f}, "
+                      f"nfw={fit_result['nfw_avg']:.4f})", flush=True)
                 continue
 
             # Check if function should be rejected
-            n_success = len(func_results)
+            n_success = len(fit_result['results'])
 
             if n_success == 0:
-                if n_negative_loss > 0:
+                if fit_result['n_negative_loss'] > 0:
                     negative_loss_func_idx.add(func_idx)
                     print(f"Rank {rank}: func {func_idx} rejected "
                           f"(negative loss) '{expr_str}'", flush=True)
@@ -1058,47 +945,31 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
                           f"'{expr_str}'", flush=True)
                 continue
 
-            # Post-fit asymptote validation for parameter-dependent asymptotes
-            reject_asymp = False
-            skip_asymp = fit_config.get('skip_postfit_asymp_check', False)
-            has_inf_check = func_idx in asymp_inf_param_dep
-            has_zero_check = func_idx in asymp_zero_param_dep
-            has_unknown_check = func_idx in asymp_unknown
-            needs_postfit_check = (has_inf_check or has_zero_check
-                                   or has_unknown_check)
-
-            if needs_postfit_check and not skip_asymp:
-                reject_asymp, n_pass_inf, n_pass_zero, n_checked = \
-                    check_postfit_asymptotes(
-                        func_idx, expr_str, func_results, binned, fit_config,
-                        asymp_inf_threshold, asymp_zero_threshold,
-                        print_prefix=f"Rank {rank}: ")
-                asymp_pass_fractions[func_idx] = (
-                    n_pass_inf, n_pass_zero, n_checked)
-
-            if reject_asymp:
-                asymp_reject_func_idx.add(func_idx)
-                # Only skip results if rejection is enabled
-                if fit_config.get('reject_asymp_failures', True):
-                    continue
-
-            results.extend(func_results)
+            results_buffer.extend(fit_result['results'])
 
         batch_time = time() - t_batch_start
         avg_per_func = batch_time / n_funcs_batch if n_funcs_batch > 0 else 0
-        print(f"Rank {rank}: {n_funcs_batch} funcs in {batch_time:.1f}s | "
-              f"{avg_per_func:.1f}s/func | {len(results)} total results",
-              flush=True)
 
         # Write results after each batch for resume support
-        if len(results) > 0 or len(negative_loss_func_idx) > 0:
-            output_path = output_dir / f"results_rank{rank}.hdf5"
-            write_results(output_path, results, equations,
-                          negative_loss_func_idx, asymp_reject_func_idx,
-                          asymp_pass_fractions)
+        has_data = (len(results_buffer) > 0 or len(negative_loss_func_idx) > 0
+                    or len(processed_func_idx) > 0)
+        if has_data:
+            ResultsFile(output_path).append(
+                results_buffer, equations, negative_loss_func_idx,
+                processed_func_idx, nfw_score)
+            total_results_written += len(results_buffer)
+            results_buffer = []  # Clear buffer after writing
 
-    print(f"Rank {rank}: finished with {len(results)} total results",
+        print(f"Rank {rank}: {n_funcs_batch} funcs in {batch_time:.1f}s | "
+              f"{avg_per_func:.1f}s/func | {total_results_written} total",
+              flush=True)
+
+    total_worker_time = time() - t_worker_start
+    print(f"Rank {rank}: finished with {total_results_written} total results",
           flush=True)
+
+    # Return timing data for aggregation
+    return total_fit_time, total_worker_time
 
 
 if __name__ == "__main__":
@@ -1150,10 +1021,18 @@ if __name__ == "__main__":
         skip_dict = load_skip_functions(skip_path)
         skip_func_idx = set(skip_dict.keys())
 
+        # Skip functions with 're(' operator
+        # (sympy real part, not C99 compilable)
+        for idx, eq in enumerate(equations):
+            if 're(' in eq and idx not in skip_dict:
+                skip_dict[idx] = "re_operator"
+                skip_func_idx.add(idx)
+
         # Load asymptotes and add pre-fit skips
         (asymp_skip, asymp_inf_param_dep,
          asymp_zero_param_dep, asymp_unknown) = \
-            cdmprof.fitting.process_asymptotes(asymp_inf_path, asymp_zero_path)
+            cdmprof.asymptotes.process_asymptotes(asymp_inf_path,
+                                                  asymp_zero_path)
 
         # Merge asymptote skips into skip_dict
         for idx, reason in asymp_skip.items():
@@ -1193,18 +1072,41 @@ if __name__ == "__main__":
     completed_func_idx = set()
     if rank == 0:
         if args.resume:
+            # First, merge any existing temp files into output
             if temp_dir.exists():
-                completed_func_idx = get_completed_func_idx(temp_dir)
+                rank_files = list(temp_dir.glob("results_rank*.hdf5"))
+                if len(rank_files) > 0:
+                    print(f"Resume: merging {len(rank_files)} temp files "
+                          f"into output...", flush=True)
+                    ResultsFile.merge(temp_dir, output_path,
+                                      delete_rank_files=True,
+                                      append_to_existing=True)
+                    print("Resume: temp files merged and deleted", flush=True)
+
+            # Now read processed func_idx from the merged output
+            if output_path.exists():
+                with h5py.File(output_path, 'r') as f:
+                    if 'processed_func_idx' in f:
+                        completed_func_idx = set(
+                            f['processed_func_idx'][:].tolist())
+                    elif 'func_idx' in f:
+                        # Fallback for old files without processed_func_idx
+                        completed_func_idx = set(f['func_idx'][:].tolist())
                 if len(completed_func_idx) > 0:
                     n_done = len(completed_func_idx)
-                    print(f"Resuming: found {n_done} completed functions",
+                    print(f"Resume: {n_done} functions already processed",
                           flush=True)
+
             temp_dir.mkdir(parents=True, exist_ok=True)
         else:
-            # Fresh start: clear any existing temp files
+            # Fresh start: clear any existing temp files and output
             if temp_dir.exists():
                 print("Clearing existing temp directory", flush=True)
                 clear_temp_dir(temp_dir)
+            if output_path.exists():
+                print(f"Deleting existing output file: {output_path}",
+                      flush=True)
+                output_path.unlink()
             temp_dir.mkdir(parents=True, exist_ok=True)
 
     # Broadcast completed_func_idx to all ranks
@@ -1216,13 +1118,14 @@ if __name__ == "__main__":
     job_queue = [i for i in all_idx
                  if i not in completed_func_idx and i not in skip_func_idx]
 
-    # DEBUG: Only test function 34
-    # job_queue = [275]
-
     # Load and bin halos on rank 0, then broadcast to all
     if rank == 0:
         halos = cdmprof.load_from_folder(args.halos)
-        binned = halos.bin(nbin=fit_config['nbin'])
+        n_sample = fit_config.get('n_sample', 0)
+        binned = halos.bin(
+            nbin=fit_config['nbin'],
+            n_sample=n_sample if n_sample > 0 else None,
+            seed=42)
         n_halos = halos.n_halos
         del halos
 
@@ -1233,6 +1136,8 @@ if __name__ == "__main__":
               f"({n_skipped} skipped, {n_completed} completed, "
               f"{len(equations)} total)", flush=True)
         print(f"Halos: {n_halos}", flush=True)
+        if n_sample > 0:
+            print(f"Downsampling: {n_sample} particles per halo", flush=True)
         print(f"Total fits: {len(job_queue) * n_halos}", flush=True)
         print(f"Output: {output_path}", flush=True)
         print(f"Temp dir: {temp_dir}", flush=True)
@@ -1248,6 +1153,8 @@ if __name__ == "__main__":
     if size == 1:
         # Single process mode: do everything on one CPU
         print("Running in single-process mode", flush=True)
+        optimizer = fit_config.get('optimizer', 'neldermead')
+        print(f"Optimizer: {optimizer}", flush=True)
         asymp_n_halos = fit_config.get('asymp_n_halos', 10)
         if asymp_n_halos > 0:
             print(f"Asymptote checks: {asymp_n_halos} random halos",
@@ -1256,51 +1163,68 @@ if __name__ == "__main__":
             print("Asymptote checks: all halos", flush=True)
 
         # Compute NFW per-halo scores upfront for early stopping comparison
-        nfw_early_stop_halos = fit_config.get('nfw_early_stop_halos', 5)
-        nfw_early_stop_factor = fit_config.get('nfw_early_stop_factor', 2.0)
-        use_nfw_early_stop = fit_config.get('nfw_early_stop_enabled', False)
-
         nfw_score = None
         nfw_per_halo = None
-        nfw_avg = None
 
-        if use_nfw_early_stop:
+        # Check if NFW early stopping might be enabled
+        nfw_early_stop_requested = (
+            fit_config.get('nfw_early_stop_enabled', False)
+            and len(fit_config.get('nfw_early_stop_halos', [])) > 0)
+
+        if nfw_early_stop_requested:
             print("Computing NFW reference scores for early stopping...",
                   flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score, nfw_per_halo = compute_nfw_scores(
                     binned, fit_config, return_per_halo=True)
-            nfw_valid = (nfw_per_halo is not None
-                         and np.any(~np.isnan(nfw_per_halo)))
-            if nfw_valid:
-                nfw_avg = np.nanmean(nfw_per_halo)
-                print(f"NFW avg score: {nfw_avg:.4f}", flush=True)
-                threshold = nfw_avg + nfw_early_stop_factor
-                print(f"NFW early stop: after {nfw_early_stop_halos} halos, "
-                      f"stop if avg > {threshold:.4f}", flush=True)
-            else:
+            if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
                       flush=True)
-                use_nfw_early_stop = False
+                nfw_per_halo = None
 
-        results = []
+        # Setup NFW early stop config (handles None nfw_per_halo)
+        nfw_config = setup_nfw_early_stop(fit_config, nfw_per_halo)
+
+        if nfw_config['enabled']:
+            print(f"NFW avg score: {nfw_config['avg_all']:.4f}", flush=True)
+            for j, (halos, factor) in enumerate(nfw_config['tiers'], 1):
+                thresh = nfw_config['avg_all'] + factor
+                print(f"NFW early stop tier {j}: n>={halos}, "
+                      f"avg>{thresh:.4f}", flush=True)
+
+        # Buffer for results - write every N functions
+        results_buffer = []
+        write_buffer_size = fit_config.get('write_buffer_size', 10)
+        temp_output = temp_dir / "results_rank0.hdf5"
+
         negative_loss_func_idx = set()
-        asymp_reject_func_idx = set()
-        asymp_pass_fractions = {}
+        processed_func_idx = set()  # Track all attempted functions
 
         n_funcs = len(job_queue)
         t_start = time()
         total_fit_time = 0.0
-        total_asymp_time = 0.0
 
-        asymp_inf_threshold = fit_config.get('asymp_inf_threshold', 0.5)
-        asymp_zero_threshold = fit_config.get('asymp_zero_threshold', 0.5)
         early_stop_threshold = fit_config.get('early_stop_failures', 5)
 
         for i, func_idx in enumerate(job_queue):
+            # Write results every N functions for resume support
+            # Check at start so continue statements don't skip the write
+            if i > 0 and i % write_buffer_size == 0:
+                has_data = (len(results_buffer) > 0
+                            or len(negative_loss_func_idx) > 0
+                            or len(processed_func_idx) > 0)
+                if has_data:
+                    ResultsFile(temp_output).append(
+                        results_buffer, equations, negative_loss_func_idx,
+                        processed_func_idx, nfw_score)
+                    results_buffer = []  # Clear buffer after writing
+
             t_func_start = time()
             expr_str = equations[func_idx]
+
+            # Mark as processed regardless of outcome
+            processed_func_idx.add(func_idx)
 
             # Print progress
             print(f"[{i+1}/{n_funcs}] Fitting '{expr_str}'", flush=True)
@@ -1316,97 +1240,34 @@ if __name__ == "__main__":
                       flush=True)
                 continue
 
-            func_results = []
-            func_norm_losses = []  # Track normalized losses for NFW comparison
-            n_negative_loss = 0
-            n_consecutive_failures = 0
-            early_stopped = False
-            nfw_early_stopped = False
-
+            # Fit to all halos
             t_fit_start = time()
-            for halo_idx in range(n_halos):
-                try:
-                    result = fitter.fit_with_restarts(
-                        binned['bin_counts'][halo_idx],
-                        binned['bin_positions'][halo_idx],
-                        binned['rmin'][halo_idx],
-                        binned['rmax'][halo_idx],
-                        max_restarts=fit_config['max_restarts'],
-                        nconv_required=fit_config['nconv_required'],
-                        conv_rtol=fit_config['conv_rtol'],
-                        Rs_lower_factor=fit_config.get('Rs_lower_factor'),
-                        Rs_upper_factor=fit_config.get('Rs_upper_factor'),
-                        a_lower=fit_config.get('a_lower'),
-                        a_upper=fit_config.get('a_upper'),
-                        xtol=fit_config['xtol'],
-                        ftol=fit_config['ftol'],
-                        maxeval=fit_config['maxeval'],
-                        seed=42 + halo_idx,
-                    )
-
-                    # Skip if fit failed (params is None)
-                    if result['params'] is None:
-                        if result.get('reject_reason') == 'negative_loss':
-                            n_negative_loss += 1
-                        # Track consecutive failures for early stopping
-                        if len(func_results) == 0:
-                            n_consecutive_failures += 1
-                            if n_consecutive_failures >= early_stop_threshold:
-                                early_stopped = True
-                                break
-                        continue
-
-                    # Reset consecutive failures on success
-                    n_consecutive_failures = 0
-
-                    # Compute normalized loss for this halo
-                    npart = np.sum(binned['bin_counts'][halo_idx])
-                    norm_loss = result['loss'] / npart
-                    func_norm_losses.append(norm_loss)
-
-                    func_results.append((
-                        func_idx, halo_idx, result['loss'],
-                        result['params'], result['converged'], result['neval'],
-                    ))
-
-                    # NFW comparison early stopping
-                    if (use_nfw_early_stop and
-                            len(func_results) >= nfw_early_stop_halos):
-                        func_avg = np.mean(func_norm_losses)
-                        if func_avg > nfw_avg + nfw_early_stop_factor:
-                            nfw_early_stopped = True
-                            break
-
-                except Exception as e:
-                    print(f"Func {func_idx}, halo {halo_idx} failed: {e}",
-                          flush=True)
-                    # Track consecutive failures for early stopping
-                    if len(func_results) == 0:
-                        n_consecutive_failures += 1
-                        if n_consecutive_failures >= early_stop_threshold:
-                            early_stopped = True
-                            break
+            fit_result = fit_function_to_halos(
+                func_idx, fitter, binned, fit_config,
+                nfw_config, nfw_per_halo, log_prefix="")
             func_fit_time = time() - t_fit_start
             total_fit_time += func_fit_time
-            func_asymp_time = 0.0
 
-            if early_stopped:
+            # Handle early stopping
+            if fit_result['early_stopped']:
                 print(f"Func {func_idx} early stopped after "
                       f"{early_stop_threshold} failures", flush=True)
                 continue
 
-            if nfw_early_stopped:
-                # Skip function entirely (don't save partial results)
-                func_avg = np.mean(func_norm_losses)
-                threshold = nfw_avg + nfw_early_stop_factor
+            if fit_result['nfw_early_stopped']:
+                n_fitted = len(fit_result['results'])
+                func_avg = np.mean([r[2] / np.sum(binned['bin_counts'][r[1]])
+                                    for r in fit_result['results']])
                 print(f"NFW early stopped '{expr_str}' "
-                      f"(avg={func_avg:.4f} > {threshold:.4f})", flush=True)
+                      f"(n={n_fitted}, avg={func_avg:.4f}, "
+                      f"nfw={fit_result['nfw_avg']:.4f})", flush=True)
                 continue
 
-            n_success = len(func_results)
+            # Check if function should be rejected
+            n_success = len(fit_result['results'])
 
             if n_success == 0:
-                if n_negative_loss > 0:
+                if fit_result['n_negative_loss'] > 0:
                     negative_loss_func_idx.add(func_idx)
                     print(f"Func {func_idx} rejected (negative loss) "
                           f"'{expr_str}'", flush=True)
@@ -1414,43 +1275,7 @@ if __name__ == "__main__":
                     print(f"All fits failed for func {func_idx} '{expr_str}'",
                           flush=True)
             else:
-                # Post-fit asymptote validation
-                reject_asymp = False
-                skip_asymp = fit_config.get('skip_postfit_asymp_check', False)
-                has_inf_check = func_idx in asymp_inf_param_dep
-                has_zero_check = func_idx in asymp_zero_param_dep
-                has_unknown_check = func_idx in asymp_unknown
-                needs_postfit_check = (has_inf_check or has_zero_check
-                                       or has_unknown_check)
-
-                if needs_postfit_check and not skip_asymp:
-                    t_asymp_start = time()
-                    reject_asymp, n_pass_inf, n_pass_zero, n_checked = \
-                        check_postfit_asymptotes(
-                            func_idx, expr_str, func_results, binned,
-                            fit_config, asymp_inf_threshold,
-                            asymp_zero_threshold, print_prefix="")
-                    func_asymp_time = time() - t_asymp_start
-                    total_asymp_time += func_asymp_time
-                    asymp_pass_fractions[func_idx] = (
-                        n_pass_inf, n_pass_zero, n_checked)
-
-                if reject_asymp:
-                    asymp_reject_func_idx.add(func_idx)
-                    # Only skip results if rejection is enabled
-                    if fit_config.get('reject_asymp_failures', True):
-                        continue
-
-                results.extend(func_results)
-
-            # Write results after each function for resume support
-            has_data = (len(results) > 0 or len(negative_loss_func_idx) > 0
-                        or len(asymp_reject_func_idx) > 0)
-            if has_data:
-                temp_output = temp_dir / "results_rank0.hdf5"
-                write_results(temp_output, results, equations,
-                              negative_loss_func_idx, asymp_reject_func_idx,
-                              asymp_pass_fractions)
+                results_buffer.extend(fit_result['results'])
 
             func_time = time() - t_func_start
             elapsed = time() - t_start
@@ -1466,136 +1291,201 @@ if __name__ == "__main__":
                 eta_str = f"{remaining:.1f} s"
 
             print(f"Completed {funcs_done}/{n_funcs} | "
-                  f"this: {func_time:.1f}s (fit={func_fit_time:.1f}, "
-                  f"asymp={func_asymp_time:.1f}) | "
+                  f"this: {func_time:.1f}s (fit={func_fit_time:.1f}s) | "
                   f"avg: {avg_per_func:.1f}s/func | ETA: {eta_str}",
                   flush=True)
 
-        # Merge all results (including any from previous runs if resuming)
-        merge_results(temp_dir, output_path, delete_rank_files=True)
+        # Flush any remaining buffered results
+        has_data = (len(results_buffer) > 0 or len(negative_loss_func_idx) > 0
+                    or len(processed_func_idx) > 0)
+        if has_data:
+            ResultsFile(temp_output).append(
+                results_buffer, equations, negative_loss_func_idx,
+                processed_func_idx, nfw_score)
+
+        # Compute npart per halo (needed for merge and ranking)
+        npart_per_halo = [np.sum(bc) for bc in binned['bin_counts']]
+
+        # Merge all results (append to existing if resuming)
+        # Pass npart_per_halo to filter params for functions worse than NFW
+        t0 = time()
+        ResultsFile.merge(temp_dir, output_path, delete_rank_files=True,
+                          append_to_existing=args.resume,
+                          npart_per_halo=npart_per_halo)
+        print(f"[timing] ResultsFile.merge: {time()-t0:.2f}s", flush=True)
         if temp_dir.exists():
             temp_dir.rmdir()
         print(f"All done! Results saved to: {output_path}", flush=True)
 
         # Print timing summary
         total_time = time() - t_start
-        other_time = total_time - total_fit_time - total_asymp_time
+        other_time = total_time - total_fit_time
         print("\nTiming breakdown:", flush=True)
-        print(f"  Fitting:    {total_fit_time:8.1f}s "
+        print(f"  Fitting: {total_fit_time:8.1f}s "
               f"({100*total_fit_time/total_time:5.1f}%)", flush=True)
-        print(f"  Asymptotes: {total_asymp_time:8.1f}s "
-              f"({100*total_asymp_time/total_time:5.1f}%)", flush=True)
-        print(f"  Other:      {other_time:8.1f}s "
+        print(f"  Other:   {other_time:8.1f}s "
               f"({100*other_time/total_time:5.1f}%)", flush=True)
-        print(f"  Total:      {total_time:8.1f}s", flush=True)
+        print(f"  Total:   {total_time:8.1f}s", flush=True)
 
-        # Print failed functions
-        print_failed_functions(output_path, equations)
+        # Print failed functions (returns categories for reuse)
+        t0 = time()
+        failed_categories = print_failed_functions(output_path, equations,
+                                                   skip_dict=skip_dict)
+        print(f"[timing] print_failed_functions: {time()-t0:.2f}s", flush=True)
 
-        # Print asymptote validation summary
-        n_param_dep = len(
-            set(asymp_inf_param_dep.keys()) | set(asymp_zero_param_dep.keys()))
-        n_unknown = len(asymp_unknown)
-        n_rejected = len(asymp_reject_func_idx)
-        print_asymptote_summary(n_param_dep, n_unknown, n_rejected,
-                                asymp_inf_threshold, asymp_zero_threshold)
-
-        # Compute npart per halo for ranking
-        npart_per_halo = [np.sum(bc) for bc in binned['bin_counts']]
-        # Functions that had post-fit asymptote checks
-        asymp_postfit_funcs = (set(asymp_inf_param_dep.keys()) |
-                               set(asymp_zero_param_dep.keys()) |
-                               asymp_unknown)
         # Compute NFW reference score (reuse if already computed)
         if nfw_score is None:
+            t0 = time()
             print("Computing NFW reference score...", flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score = compute_nfw_scores(binned, fit_config)
+            print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s", flush=True)
+
+        t0 = time()
+        min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
         print_best_results(output_path, equations, npart_per_halo,
-                           asymp_postfit_funcs, nfw_score)
+                           nfw_score=nfw_score,
+                           min_success_fraction=min_success_frac)
+        print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
+
+        # Save results to text files if enabled
+        if fit_config.get('save_text_results', True):
+            t0 = time()
+            write_ranking_to_file(output_path, equations, npart_per_halo,
+                                  nfw_score=nfw_score,
+                                  min_success_fraction=min_success_frac)
+            print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
+                  flush=True)
+            t0 = time()
+            write_failed_to_files(output_path, failed_categories)
+            print(f"[timing] write_failed_to_files: {time()-t0:.2f}s",
+                  flush=True)
 
     else:
         # Multi-process mode: master-worker pattern
         if rank == 0:
-            asymp_n_halos = fit_config.get('asymp_n_halos', 10)
-            if asymp_n_halos > 0:
-                print(f"Asymptote checks: {asymp_n_halos} random halos",
-                      flush=True)
-            else:
-                print("Asymptote checks: all halos", flush=True)
+            optimizer = fit_config.get('optimizer', 'neldermead')
+            print(f"Optimizer: {optimizer}", flush=True)
 
         # Compute NFW per-halo scores on rank 0 for early stopping comparison
+        nfw_score = None
         nfw_per_halo = None
-        use_nfw_early_stop = fit_config.get('nfw_early_stop_enabled', False)
-        nfw_early_stop_halos = fit_config.get('nfw_early_stop_halos', 5)
-        nfw_early_stop_factor = fit_config.get('nfw_early_stop_factor', 2.0)
-        if rank == 0 and use_nfw_early_stop:
+
+        # Check if NFW early stopping might be enabled
+        nfw_early_stop_requested = (
+            fit_config.get('nfw_early_stop_enabled', False)
+            and len(fit_config.get('nfw_early_stop_halos', [])) > 0)
+
+        if rank == 0 and nfw_early_stop_requested:
             print("Computing NFW reference scores for early stopping...",
                   flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
-                _, nfw_per_halo = compute_nfw_scores(
+                nfw_score, nfw_per_halo = compute_nfw_scores(
                     binned, fit_config, return_per_halo=True)
-            nfw_valid = (nfw_per_halo is not None
-                         and np.any(~np.isnan(nfw_per_halo)))
-            if nfw_valid:
-                nfw_avg = np.nanmean(nfw_per_halo)
-                print(f"NFW avg score: {nfw_avg:.4f}", flush=True)
-                threshold = nfw_avg + nfw_early_stop_factor
-                print(f"NFW early stop: after {nfw_early_stop_halos} halos, "
-                      f"stop if avg > {threshold:.4f}", flush=True)
-            else:
+            if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
                       flush=True)
                 nfw_per_halo = None
+            else:
+                # Use setup function to get config for printing
+                nfw_config = setup_nfw_early_stop(fit_config, nfw_per_halo)
+                print(f"NFW avg score: {nfw_config['avg_all']:.4f}",
+                      flush=True)
+                for j, (halos, factor) in enumerate(nfw_config['tiers'], 1):
+                    thresh = nfw_config['avg_all'] + factor
+                    print(f"NFW early stop tier {j}: n>={halos}, "
+                          f"avg>{thresh:.4f}", flush=True)
 
-        # Broadcast NFW per-halo scores to all workers
+        # Broadcast NFW scores to all workers
+        nfw_score = comm.bcast(nfw_score, root=0)
         nfw_per_halo = comm.bcast(nfw_per_halo, root=0)
 
         if rank == 0:
+            t_mpi_start = time()
             master_loop(comm, job_queue, fit_config['batch_size'])
+            worker_timing = None
         else:
-            worker_loop(comm, equations, binned, temp_dir, fit_config,
-                        asymp_inf_param_dep, asymp_zero_param_dep,
-                        asymp_unknown, nfw_per_halo)
+            worker_timing = worker_loop(
+                comm, equations, binned, temp_dir, fit_config,
+                nfw_per_halo, nfw_score)
 
         comm.Barrier()
 
+        # Gather timing from all workers to rank 0
+        all_timing = comm.gather(worker_timing, root=0)
+
         if rank == 0:
-            merge_results(temp_dir, output_path, delete_rank_files=True)
+            # Compute npart per halo (needed for merge and ranking)
+            npart_per_halo = [np.sum(bc) for bc in binned['bin_counts']]
+
+            t0 = time()
+            ResultsFile.merge(temp_dir, output_path, delete_rank_files=True,
+                              append_to_existing=args.resume,
+                              npart_per_halo=npart_per_halo)
+            print(f"[timing] ResultsFile.merge: {time()-t0:.2f}s", flush=True)
             if temp_dir.exists():
                 temp_dir.rmdir()
             print(f"All done! Results saved to: {output_path}", flush=True)
 
-            # Print failed functions
-            print_failed_functions(output_path, equations)
+            # Print failed functions (returns categories for reuse)
+            t0 = time()
+            failed_categories = print_failed_functions(output_path, equations,
+                                                       skip_dict=skip_dict)
+            print(f"[timing] print_failed_functions: {time()-t0:.2f}s",
+                  flush=True)
 
-            # Print asymptote validation summary
-            n_param_dep = len(set(asymp_inf_param_dep.keys())
-                              | set(asymp_zero_param_dep.keys()))
-            n_unknown = len(asymp_unknown)
-            # Read n_rejected from merged file
-            with h5py.File(output_path, 'r') as f:
-                if 'asymp_reject_func_idx' in f:
-                    n_rejected = len(f['asymp_reject_func_idx'][:])
-                else:
-                    n_rejected = 0
-            print_asymptote_summary(
-                n_param_dep, n_unknown, n_rejected,
-                fit_config.get('asymp_inf_threshold', 0.5),
-                fit_config.get('asymp_zero_threshold', 0.5))
-
-            # Compute npart per halo for ranking
-            npart_per_halo = [np.sum(bc) for bc in binned['bin_counts']]
-            # Functions that had post-fit asymptote checks
-            asymp_postfit_funcs = (set(asymp_inf_param_dep.keys()) |
-                                   set(asymp_zero_param_dep.keys()) |
-                                   asymp_unknown)
             # Compute NFW reference score (reuse if already computed)
-            print("Computing NFW reference score...", flush=True)
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="reimporting")
-                nfw_score = compute_nfw_scores(binned, fit_config)
+            if nfw_score is None:
+                t0 = time()
+                print("Computing NFW reference score...", flush=True)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="reimporting")
+                    nfw_score = compute_nfw_scores(binned, fit_config)
+                print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s",
+                      flush=True)
+
+            t0 = time()
+            min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
             print_best_results(output_path, equations, npart_per_halo,
-                               asymp_postfit_funcs, nfw_score)
+                               nfw_score=nfw_score,
+                               min_success_fraction=min_success_frac)
+            print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
+
+            # Save results to text files if enabled
+            if fit_config.get('save_text_results', True):
+                t0 = time()
+                write_ranking_to_file(output_path, equations, npart_per_halo,
+                                      nfw_score=nfw_score,
+                                      min_success_fraction=min_success_frac)
+                print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
+                      flush=True)
+                t0 = time()
+                write_failed_to_files(output_path, failed_categories)
+                print(f"[timing] write_failed_to_files: {time()-t0:.2f}s",
+                      flush=True)
+
+            # Print worker timing summary
+            total_mpi_time = time() - t_mpi_start
+            # all_timing[0] is None (master), rest are workers
+            worker_timings = [(i, t) for i, t in enumerate(all_timing)
+                              if t is not None]
+            if len(worker_timings) > 0:
+                print(f"\nWorker timing summary "
+                      f"({len(worker_timings)} workers):", flush=True)
+                print(f"  {'Rank':<6} {'Fitting':>10} {'Other':>10} "
+                      f"{'Total':>10}", flush=True)
+                print(f"  {'-'*6} {'-'*10} {'-'*10} {'-'*10}", flush=True)
+                for rank_i, (fit_t, total_t) in worker_timings:
+                    other_t = total_t - fit_t
+                    print(f"  {rank_i:<6} {fit_t:>9.1f}s {other_t:>9.1f}s "
+                          f"{total_t:>9.1f}s", flush=True)
+                # Print totals
+                total_fit = sum(t[0] for _, t in worker_timings)
+                total_cpu = sum(t[1] for _, t in worker_timings)
+                total_other = total_cpu - total_fit
+                print(f"  {'-'*6} {'-'*10} {'-'*10} {'-'*10}", flush=True)
+                print(f"  {'Total':<6} {total_fit:>9.1f}s "
+                      f"{total_other:>9.1f}s {total_cpu:>9.1f}s", flush=True)
+                print(f"  Wall time: {total_mpi_time:.1f}s", flush=True)
