@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Richard Stiskalek
+# Copyright (C) 2025 Richard Stiskalek
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the
 # Free Software Foundation; either version 3 of the License, or (at your
@@ -28,25 +28,21 @@ from .symbolic import SympyParser
 # Path to C source files
 CSRC_DIR = Path(__file__).parent / "csrc"
 
+# Constants for is_bad_function
+_BAD_PREFIXES = ("0", "zoo", "<class")
+_BAD_SUBSTRINGS = ("oo", "nan", "NaN")
+_TRIG_FUNCTIONS = ("sin", "cos", "tan", "arcsin", "arccos", "atan")
+
+# Optimizer type mapping
+OPTIMIZER_MAP = {
+    'neldermead': 0,
+    'nelder-mead': 0,
+    'bobyqa': 1,
+}
+
 
 def _has_normalization_only_param(expr_str):
-    """
-    Check if any parameter is just an overall normalization factor.
-
-    A parameter `a` is normalization-only if f = a * g(x) or f = Abs(a) * g(x)
-    where g doesn't contain `a`. We check this by seeing if f/a or f/Abs(a)
-    is independent of a.
-
-    Parameters
-    ----------
-    expr_str : str
-        Expression string.
-
-    Returns
-    -------
-    bool
-        True if any parameter is normalization-only.
-    """
+    """Check if any parameter is just a normalization factor (f = a * g(x))."""
     x = symbols('x', positive=True)
     # Don't assume sign for parameters - fitter allows [-500, 500]
     params = [symbols(f'a{i}', real=True) for i in range(4)]
@@ -80,25 +76,7 @@ def _has_normalization_only_param(expr_str):
 
 
 def _detect_abs_wrapped_params(expr_str, parser=None):
-    """
-    Detect parameters that appear exactly wrapped in Abs().
-
-    Only detects exact patterns like Abs(a0), NOT Abs(a0 + 1).
-
-    Parameters
-    ----------
-    expr_str : str
-        Expression string.
-    parser : SympyParser, optional
-        Parser instance. If None, creates a new one.
-
-    Returns
-    -------
-    set
-        Set of parameter indices (0-3) that are wrapped in Abs().
-        E.g., "Abs(a0) + a1" returns {0}
-             "Abs(a0 + 1)" returns {} (not exact)
-    """
+    """Return set of param indices (0-3) exactly wrapped in Abs()."""
     if parser is None:
         parser = SympyParser()
 
@@ -121,61 +99,22 @@ def _detect_abs_wrapped_params(expr_str, parser=None):
 
 
 def is_bad_function(expr_str):
-    """
-    Check if expression is invalid (infinity, NaN, trig functions, etc.).
-
-    Parameters
-    ----------
-    expr_str : str
-        Expression string.
-
-    Returns
-    -------
-    bool
-    """
-    # Bad prefixes
-    bad_prefixes = ["0", "zoo", "<class"]
-    if any(expr_str.startswith(bp) for bp in bad_prefixes):
+    """Check if expression is invalid (infinity, NaN, trig, etc.)."""
+    if expr_str.startswith(_BAD_PREFIXES):
         return True
-
-    # Bad substrings (infinity, NaN)
-    bad_substrings = ["oo", "nan", "NaN"]
-    if any(bs in expr_str for bs in bad_substrings):
+    if any(bs in expr_str for bs in _BAD_SUBSTRINGS):
         return True
-
-    # Trigonometric functions (not suitable for density profiles)
-    trigs = ["sin", "cos", "tan", "arcsin", "arccos", "atan"]
-    if any(trig in expr_str for trig in trigs):
+    if any(trig in expr_str for trig in _TRIG_FUNCTIONS):
         return True
-
-    # Check for normalization-only parameters
     if _has_normalization_only_param(expr_str):
         return True
-
     return False
 
 
 def load_equations(filepath):
-    """
-    Load equations from a text file (one per line), skipping empty lines.
-
-    Parameters
-    ----------
-    filepath : str or Path
-        Path to equations file.
-
-    Returns
-    -------
-    list of str
-        List of equation strings.
-    """
-    equations = []
+    """Load equations from a text file (one per line), skipping empty lines."""
     with open(filepath, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                equations.append(line)
-    return equations
+        return [line.strip() for line in f if line.strip()]
 
 
 ###############################################################################
@@ -186,14 +125,9 @@ def load_equations(filepath):
 def _read_csrc(name):
     """Read a C source file, stripping local #include directives."""
     with open(CSRC_DIR / name, 'r') as f:
-        content = f.read()
-    # Remove local includes (they'll be inlined)
-    lines = []
-    for line in content.split('\n'):
-        if line.strip().startswith('#include "'):
-            continue
-        lines.append(line)
-    return '\n'.join(lines)
+        lines = f.read().split('\n')
+    return '\n'.join(
+        ln for ln in lines if not ln.strip().startswith('#include "'))
 
 
 def _get_nlopt_paths():
@@ -217,25 +151,7 @@ def compile_fitter(expr_str, parser=None, simpson_n=512):
     """
     JIT compile a density function + loss + optimizer.
 
-    Parameters
-    ----------
-    expr_str : str
-        Symbolic expression for the density profile
-        (e.g., "1 / (x * (1 + x)**a0)")
-    parser : SympyParser, optional
-        Parser instance. If None, creates a new one.
-    simpson_n : int, optional
-        Number of intervals for Simpson integration. Must be even.
-        Higher values give more accuracy but slower computation.
-        Default: 512.
-
-    Returns
-    -------
-    callable
-        Function with signature:
-        fit(bin_counts, bin_positions, rmin, rmax, ...) -> dict
-
-        Also has fit.fit_with_restarts(...) for multi-restart optimization.
+    Returns a fit() function with fit.fit_with_restarts() for multi-restart.
     """
     if parser is None:
         parser = SympyParser()
@@ -353,49 +269,13 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         extra_compile_args=["-O3", "-ffast-math", "-march=native"],
     )
 
-    # Optimizer type mapping
-    OPTIMIZER_MAP = {
-        'neldermead': 0,
-        'nelder-mead': 0,
-        'bobyqa': 1,
-    }
-
     # Create Python wrapper
     def fit(bin_counts, bin_positions, rmin, rmax,
             initial_params=None, lower_bounds=None, upper_bounds=None,
             xtol=1e-6, ftol=1e-6, maxeval=1000, optimizer='neldermead'):
         """
-        Fit the density profile to binned halo data.
-
-        Parameters
-        ----------
-        bin_counts : array-like, shape (nbin,)
-            Particle counts per bin.
-        bin_positions : array-like, shape (nbin,)
-            Radial bin positions.
-        rmin : float
-            Minimum radius for mass integration.
-        rmax : float
-            Maximum radius for mass integration.
-        initial_params : array-like, optional
-            Initial parameter guess [Rs, a0, a1, ...].
-        lower_bounds : array-like, optional
-            Lower bounds [Rs_min, a0_min, ...].
-        upper_bounds : array-like, optional
-            Upper bounds [Rs_max, a0_max, ...].
-        xtol : float, optional
-            Relative tolerance on parameters.
-        ftol : float, optional
-            Relative tolerance on function value.
-        maxeval : int, optional
-            Maximum function evaluations.
-        optimizer : str, optional
-            Optimizer to use: 'neldermead' or 'bobyqa'. Default: 'neldermead'.
-
-        Returns
-        -------
-        dict
-            {'loss': float, 'params': array, 'converged': bool, 'neval': int}
+        Fit density profile to binned data. Returns dict with loss, params,
+        converged, neval.
         """
         bin_counts = np.ascontiguousarray(bin_counts, dtype=np.float64)
         bin_positions = np.ascontiguousarray(bin_positions, dtype=np.float64)
@@ -464,64 +344,9 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         """
         Fit with multiple random restarts and early stopping.
 
-        Runs up to `max_restarts` optimization attempts. Stops early if the
-        optimizer converges to the same minimum `nconv_required` times without
-        finding anything better.
-
-        Parameters
-        ----------
-        bin_counts : array-like, shape (nbin,)
-            Particle counts per bin.
-        bin_positions : array-like, shape (nbin,)
-            Radial bin positions.
-        rmin : float
-            Minimum radius for mass integration.
-        rmax : float
-            Maximum radius for mass integration.
-        max_restarts : int, optional
-            Maximum number of restarts. Default: 50.
-        nconv_required : int, optional
-            Number of convergences to same minimum required to stop early.
-            Default: 5.
-        conv_rtol : float, optional
-            Relative tolerance for considering two losses as converged to
-            the same minimum. Default: 1e-3.
-        conv_atol : float, optional
-            Absolute tolerance for considering two losses as converged to
-            the same minimum. Default: 10.
-        param_bounds : list of tuples, optional
-            Bounds [(low, high), ...] for sampling and optimization.
-            If None, uses Rs_lower/upper_factor and a_lower/upper.
-        Rs_lower_factor : float, optional
-            Rs_min = rmin * Rs_lower_factor. Default: 0.25.
-        Rs_upper_factor : float, optional
-            Rs_max = rmax * Rs_upper_factor. Default: 10.0.
-        a_lower : float, optional
-            Lower bound for a0-a3 parameters. Default: -500.0.
-        a_upper : float, optional
-            Upper bound for a0-a3 parameters. Default: 500.0.
-        xtol : float, optional
-            Relative tolerance on parameters.
-        ftol : float, optional
-            Relative tolerance on function value.
-        maxeval : int, optional
-            Maximum function evaluations per restart.
-        seed : int, optional
-            Random seed for reproducibility.
-        optimizer : str, optional
-            Optimizer to use: 'neldermead' or 'bobyqa'. Default: 'neldermead'.
-
-        Returns
-        -------
-        dict
-            loss : float - best loss found
-            params : array or None - best parameters (None if rejected)
-            converged : bool - whether best run's optimizer converged
-            confirmed : bool - converged to same min nconv_required times
-            neval : int - total function evaluations across all restarts
-            nrestart_used : int - number of restarts before stopping
-            nconv : int - times converged to the best minimum
-            reject_reason : str or None - reason for rejection
+        Stops early if optimizer converges to the same minimum `nconv_required`
+        times. Returns dict with loss, params, converged, confirmed, neval,
+        nrestart_used, nconv, reject_reason.
         """
         rng = np.random.default_rng(seed)
 
@@ -612,6 +437,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
     fit.expr_str = expr_str
     fit.nparams = nparams
     fit.nfree = nfree
+    fit.simpson_n = simpson_n
     fit.abs_wrapped_params = abs_wrapped_params
     fit.fit_with_restarts = fit_with_restarts
 
