@@ -99,6 +99,38 @@ double compute_loss(double* bin_counts, double* bin_positions, int nbin,
      * M = enclosed mass from Simpson integration.
      */
 
+    /* Check density at r=0: if finite, must be positive */
+    double rho_zero = rho(0.0, Rs, a0, a1, a2, a3);
+    if (isfinite(rho_zero) && rho_zero <= 0.0) {
+        return DBL_MAX;
+    }
+
+    /*
+     * Check r^2 * rho(r) is non-increasing between rmax and 10*rmax.
+     * This ensures the mass shell contribution decreases with radius.
+     * Sample 10 points logarithmically spaced.
+     */
+    double rmax = grid->r[SIMPSON_N];
+    double r_outer_max = 10.0 * rmax;
+    double log_ratio = log(r_outer_max / rmax) / 10.0;
+    double r_check = rmax;
+    double rho_val = rho(r_check, Rs, a0, a1, a2, a3);
+    double r2rho_prev = r_check * r_check * rho_val;
+
+    for (int i = 1; i <= 10; i++) {
+        r_check = rmax * exp(i * log_ratio);
+        rho_val = rho(r_check, Rs, a0, a1, a2, a3);
+        double r2rho = r_check * r_check * rho_val;
+
+        /* If both are finite, check non-increasing */
+        if (isfinite(r2rho) && isfinite(r2rho_prev)) {
+            if (r2rho > r2rho_prev) {
+                return DBL_MAX;  /* Mass shell increased - reject */
+            }
+        }
+        r2rho_prev = r2rho;
+    }
+
     double sum_log_term = 0.0;
 
     /* Compute sum of n_i * (2*log(r_i) + log(rho(r_i))) */

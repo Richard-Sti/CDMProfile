@@ -76,6 +76,8 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
     nlopt_algorithm algo;
     if (optimizer_type == OPT_BOBYQA) {
         algo = NLOPT_LN_BOBYQA;
+    } else if (optimizer_type == OPT_SBPLX) {
+        algo = NLOPT_LN_SBPLX;
     } else {
         algo = NLOPT_LN_NELDERMEAD;  /* Default */
     }

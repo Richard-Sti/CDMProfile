@@ -24,7 +24,8 @@
  */
 typedef enum {
     OPT_NELDERMEAD = 0,
-    OPT_BOBYQA = 1
+    OPT_BOBYQA = 1,
+    OPT_SBPLX = 2
 } OptimizerType;
 
 /*
@@ -59,7 +60,7 @@ typedef struct {
  *   xtol           - Relative tolerance on parameters
  *   ftol           - Relative tolerance on function value
  *   maxeval        - Maximum function evaluations
- *   optimizer_type - Optimizer to use (OPT_NELDERMEAD or OPT_BOBYQA)
+ *   optimizer_type - Optimizer: OPT_NELDERMEAD, OPT_BOBYQA, or OPT_SBPLX
  *   out_params     - Output: best-fit parameters in physical space
  *   out_loss       - Output: best-fit loss value
  *   out_converged  - Output: 1 if converged, 0 otherwise
