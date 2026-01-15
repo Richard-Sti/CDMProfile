@@ -20,6 +20,14 @@
 #include "loss.h"
 
 /*
+ * Optimizer type enumeration.
+ */
+typedef enum {
+    OPT_NELDERMEAD = 0,
+    OPT_BOBYQA = 1
+} OptimizerType;
+
+/*
  * Data passed to the objective function.
  */
 typedef struct {
@@ -34,7 +42,7 @@ typedef struct {
 } ObjectiveData;
 
 /*
- * Fit a density profile to halo data using Nelder-Mead optimization.
+ * Fit a density profile to halo data using the specified optimizer.
  * Rs is optimized in log-space to ensure positivity.
  *
  * Parameters:
@@ -52,6 +60,7 @@ typedef struct {
  *   xtol           - Relative tolerance on parameters
  *   ftol           - Relative tolerance on function value
  *   maxeval        - Maximum function evaluations
+ *   optimizer_type - Optimizer to use (OPT_NELDERMEAD or OPT_BOBYQA)
  *   out_params     - Output: best-fit parameters in physical space
  *   out_loss       - Output: best-fit loss value
  *   out_converged  - Output: 1 if converged, 0 otherwise
@@ -62,6 +71,7 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
                  DensityFunc rho, int nparams, double* initial_params,
                  double* lower_bounds, double* upper_bounds,
                  double xtol, double ftol, int maxeval,
+                 int optimizer_type,
                  double* out_params, double* out_loss,
                  int* out_converged, int* out_neval);
 

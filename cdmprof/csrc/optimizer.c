@@ -56,6 +56,7 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
                  DensityFunc rho, int nparams, double* initial_params,
                  double* lower_bounds, double* upper_bounds,
                  double xtol, double ftol, int maxeval,
+                 int optimizer_type,
                  double* out_params, double* out_loss,
                  int* out_converged, int* out_neval) {
 
@@ -70,8 +71,16 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
     obj_data.rho = rho;
     obj_data.nparams = nparams;
 
-    /* Create NLopt optimizer: Nelder-Mead */
-    nlopt_opt opt = nlopt_create(NLOPT_LN_NELDERMEAD, nparams);
+    /* Select NLopt algorithm based on optimizer_type */
+    nlopt_algorithm algo;
+    if (optimizer_type == OPT_BOBYQA) {
+        algo = NLOPT_LN_BOBYQA;
+    } else {
+        algo = NLOPT_LN_NELDERMEAD;  /* Default */
+    }
+
+    /* Create NLopt optimizer */
+    nlopt_opt opt = nlopt_create(algo, nparams);
     if (opt == NULL) {
         *out_loss = 1e30;
         *out_converged = 0;
