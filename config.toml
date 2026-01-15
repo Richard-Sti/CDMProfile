@@ -29,8 +29,8 @@ simpson_n = 512  # Number of intervals (must be even). Higher = more accurate bu
 
 # Multi-restart settings (lists indexed by number of free parameters: 1, 2, 3, ...)
 # Functions with more free params than list length use the last value
-max_restarts = [100, 300, 1000]
-nconv_required = [10, 20, 40]
+max_restarts = [500, 1000, 2000]
+nconv_required = [10, 10, 10]
 conv_rtol = 1e-3
 conv_atol = 10
 
@@ -45,8 +45,8 @@ min_halo_success_fraction = 0.5
 # is worse than NFW's avg + factor (absolute threshold).
 # Multiple tiers: checked in order, earlier tiers catch clearly bad functions faster
 nfw_early_stop_enabled = true
-nfw_early_stop_halos = [10, 50, 100]       # Check after this many halos
-nfw_early_stop_factors = [2.0, 1.5, 1] # Stop if avg > NFW_avg + factor
+nfw_early_stop_halos = [50, 100]       # Check after this many halos
+nfw_early_stop_factors = [2, 1]        # Stop if avg > NFW_avg + factor
 nfw_early_stop_same_halos = true  # Compare against NFW avg for same N halos (true) or all halos (false)
 
 # Parameter bounds for fitting
@@ -54,8 +54,8 @@ nfw_early_stop_same_halos = true  # Compare against NFW avg for same N halos (tr
 Rs_lower_factor = 0.25      # Rs_min = rmin * Rs_lower_factor
 Rs_upper_factor = 10.0      # Rs_max = rmax * Rs_upper_factor
 # a0-a3 bounds (absolute)
-a_lower = -500.0
-a_upper = 500.0
+a_lower = -50.0
+a_upper = 50.0
 
 [asymptotes]
 # Post-fit asymptote validation for parameter-dependent functions
