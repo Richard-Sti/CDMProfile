@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 from cffi import FFI
+from scipy.stats import qmc
 from sympy import Abs, ccode, simplify, symbols, sympify
 
 from .symbolic import SympyParser
@@ -38,7 +39,48 @@ OPTIMIZER_MAP = {
     'neldermead': 0,
     'nelder-mead': 0,
     'bobyqa': 1,
+    'sbplx': 2,
+    'subplex': 2,
 }
+
+
+def _generate_lhs_samples(param_bounds, n_samples, seed=None):
+    """
+    Generate initial parameters using Latin Hypercube Sampling.
+
+    Parameters
+    ----------
+    param_bounds : list of tuples
+        List of (low, high) bounds for each parameter.
+        First parameter (Rs) is sampled log-uniformly.
+    n_samples : int
+        Number of samples to generate.
+    seed : int, optional
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape (n_samples, n_params) with initial parameter values.
+    """
+    n_params = len(param_bounds)
+    sampler = qmc.LatinHypercube(d=n_params, seed=seed)
+    # Generate samples in [0, 1]^d
+    unit_samples = sampler.random(n=n_samples)
+
+    # Scale to parameter bounds
+    samples = np.zeros((n_samples, n_params), dtype=np.float64)
+    for i, (low, high) in enumerate(param_bounds):
+        if i == 0:
+            # Rs: log-uniform sampling
+            log_low, log_high = np.log(low), np.log(high)
+            samples[:, i] = np.exp(
+                unit_samples[:, i] * (log_high - log_low) + log_low)
+        else:
+            # Other parameters: uniform sampling
+            samples[:, i] = unit_samples[:, i] * (high - low) + low
+
+    return samples
 
 
 def _has_normalization_only_param(expr_str):
@@ -340,16 +382,15 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                           Rs_lower_factor=0.25, Rs_upper_factor=10.0,
                           a_lower=-500.0, a_upper=500.0,
                           xtol=1e-6, ftol=1e-6, maxeval=5000, seed=None,
-                          optimizer='neldermead'):
+                          optimizer='sbplx'):
         """
-        Fit with multiple random restarts and early stopping.
+        Fit with multiple restarts using Latin Hypercube Sampling.
 
-        Stops early if optimizer converges to the same minimum `nconv_required`
-        times. Returns dict with loss, params, converged, confirmed, neval,
+        Uses LHS for better coverage of parameter space. Stops early if
+        optimizer converges to the same minimum `nconv_required` times.
+        Returns dict with loss, params, converged, confirmed, neval,
         nrestart_used, nconv, reject_reason.
         """
-        rng = np.random.default_rng(seed)
-
         if param_bounds is None:
             param_bounds = [(rmin * Rs_lower_factor, rmax * Rs_upper_factor)]
             for i in range(nfree):
@@ -362,6 +403,9 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         lower_bounds = np.array([b[0] for b in param_bounds], dtype=np.float64)
         upper_bounds = np.array([b[1] for b in param_bounds], dtype=np.float64)
 
+        # Pre-generate all initial points using Latin Hypercube Sampling
+        lhs_samples = _generate_lhs_samples(param_bounds, max_restarts, seed)
+
         best_loss = np.inf
         best_params = None
         best_converged = False
@@ -372,15 +416,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         for restart_idx in range(max_restarts):
             nrestart_used += 1
 
-            # Generate initial parameters (uniform sampling)
-            initial_params = np.zeros(nparams, dtype=np.float64)
-            for i, (low, high) in enumerate(param_bounds):
-                if i == 0:
-                    # Rs: log-uniform sampling
-                    log_val = rng.uniform(np.log(low), np.log(high))
-                    initial_params[i] = np.exp(log_val)
-                else:
-                    initial_params[i] = rng.uniform(low, high)
+            # Use pre-generated LHS sample
+            initial_params = lhs_samples[restart_idx]
 
             result = fit(bin_counts, bin_positions, rmin, rmax,
                          initial_params=initial_params,
