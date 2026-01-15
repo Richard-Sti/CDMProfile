@@ -73,7 +73,8 @@ class HaloData:
         """Get radii by halo ID."""
         return self.load(halo_id)
 
-    def bin(self, nbin, log=True, indices=None, verbose=True):
+    def bin(self, nbin, log=True, indices=None, n_sample=None, seed=None,
+            verbose=True):
         """
         Bin particle radii into counts. Each halo is binned between its
         own rmin and rmax.
@@ -86,6 +87,11 @@ class HaloData:
             If True, use logarithmic bins. Default: True.
         indices : array-like, optional
             Indices of halos to bin (0 to n_halos-1). Default: all halos.
+        n_sample : int, optional
+            If specified, randomly downsample each halo to this many particles
+            before binning. Halos with fewer particles are kept as-is.
+        seed : int, optional
+            Random seed for reproducible downsampling.
         verbose : bool, optional
             If True, show progress bar. Default: True.
 
@@ -110,11 +116,26 @@ class HaloData:
         rmax_arr = np.zeros(nhalo, dtype=np.float64)
         npart = np.zeros(nhalo, dtype=np.int64)
 
+        # Setup random generator for downsampling
+        rng = np.random.default_rng(seed) if n_sample is not None else None
+        n_upsampled = 0  # Track halos that needed upsampling
+
         # Compute bin counts using direct indexing (faster than np.histogram)
         iterator = tqdm(enumerate(indices), total=nhalo, desc="Binning",
                         disable=not verbose)
         for i, idx in iterator:
             radii = self.load_by_index(idx)
+
+            # Resample if requested
+            if n_sample is not None:
+                if len(radii) > n_sample:
+                    # Downsample without replacement
+                    radii = rng.choice(radii, size=n_sample, replace=False)
+                elif len(radii) < n_sample:
+                    # Upsample with replacement
+                    radii = rng.choice(radii, size=n_sample, replace=True)
+                    n_upsampled += 1
+
             rmin = radii.min()
             rmax = radii.max()
             rmin_arr[i] = rmin
@@ -146,6 +167,11 @@ class HaloData:
         # Ensure exact boundary values (avoid floating-point drift)
         bin_edges[:, 0] = rmin_arr
         bin_edges[:, -1] = rmax_arr
+
+        # Warn if any halos were upsampled
+        if n_upsampled > 0:
+            print(f"Warning: {n_upsampled}/{nhalo} halos had fewer than "
+                  f"{n_sample} particles and were upsampled with replacement")
 
         return {
             'bin_counts': bin_counts,
