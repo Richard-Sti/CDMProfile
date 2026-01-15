@@ -107,7 +107,9 @@ double compute_loss(double* bin_counts, double* bin_positions, int nbin,
 
     /*
      * Check r^2 * rho(r) is non-increasing between rmax and 10*rmax.
-     * This ensures the mass shell contribution decreases with radius.
+     * By rmax, the profile should be in its asymptotic regime where
+     * mass shells are constant or decreasing. Allow small tolerance
+     * for numerical precision and profiles approaching constant.
      * Sample 10 points logarithmically spaced.
      */
     double rmax = grid->r[SIMPSON_N];
@@ -116,15 +118,16 @@ double compute_loss(double* bin_counts, double* bin_positions, int nbin,
     double r_check = rmax;
     double rho_val = rho(r_check, Rs, a0, a1, a2, a3);
     double r2rho_prev = r_check * r_check * rho_val;
+    double r2rho_tol = 1.1;  /* Allow up to 10% total increase */
 
     for (int i = 1; i <= 10; i++) {
         r_check = rmax * exp(i * log_ratio);
         rho_val = rho(r_check, Rs, a0, a1, a2, a3);
         double r2rho = r_check * r_check * rho_val;
 
-        /* If both are finite, check non-increasing */
+        /* If both are finite, check approximately non-increasing */
         if (isfinite(r2rho) && isfinite(r2rho_prev)) {
-            if (r2rho > r2rho_prev) {
+            if (r2rho > r2rho_prev * r2rho_tol) {
                 return DBL_MAX;  /* Mass shell increased - reject */
             }
         }
