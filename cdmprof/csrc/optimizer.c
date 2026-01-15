@@ -46,7 +46,7 @@ static double nlopt_objective(unsigned n, const double* x,
     double a3 = (obj->nparams >= 5) ? x[4] : 0.0;
 
     return compute_loss(obj->bin_counts, obj->bin_positions, obj->nbin,
-                        obj->npart, obj->rmin, obj->rmax,
+                        obj->npart, &obj->grid,
                         obj->rho, Rs, a0, a1, a2, a3);
 }
 
@@ -66,10 +66,11 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
     obj_data.bin_positions = bin_positions;
     obj_data.nbin = nbin;
     obj_data.npart = npart;
-    obj_data.rmin = rmin;
-    obj_data.rmax = rmax;
     obj_data.rho = rho;
     obj_data.nparams = nparams;
+
+    /* Precompute Simpson grid once for entire optimization */
+    simpson_grid_init(&obj_data.grid, rmin, rmax);
 
     /* Select NLopt algorithm based on optimizer_type */
     nlopt_algorithm algo;

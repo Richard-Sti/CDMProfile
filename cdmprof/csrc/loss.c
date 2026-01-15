@@ -19,68 +19,75 @@
 #include "loss.h"
 
 
-double simpson_mass(DensityFunc rho, double rmin, double rmax, int N,
+void simpson_grid_init(SimpsonGrid* grid, double rmin, double rmax) {
+    /*
+     * Precompute the Simpson integration grid.
+     * Uses multiplicative stepping to compute r and r^3 efficiently.
+     */
+    grid->h = (log(rmax) - log(rmin)) / (double)SIMPSON_N;
+    double ratio = exp(grid->h);
+    double ratio3 = ratio * ratio * ratio;
+
+    double r = rmin;
+    double r3 = rmin * rmin * rmin;
+
+    for (int i = 0; i <= SIMPSON_N; i++) {
+        grid->r[i] = r;
+        grid->r3[i] = r3;
+        r *= ratio;
+        r3 *= ratio3;
+    }
+}
+
+
+double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
                     double Rs, double a0, double a1, double a2, double a3) {
     /*
-     * Simpson's 1/3 rule for integrating 4*pi*r^2*rho(r) from rmin to rmax.
-     * Uses N intervals (N+1 points). N must be even.
+     * Simpson's 1/3 rule for integrating 4*pi*r^2*rho(r) using precomputed grid.
+     * Uses SIMPSON_N intervals (SIMPSON_N+1 points). SIMPSON_N must be even.
      * Also checks that the density profile is monotonically decreasing.
-     *
-     * Uses logarithmic spacing via change of variables u = log(r):
-     *   dr = r * du
-     *   integral of 4*pi*r^2*rho(r) dr = integral of 4*pi*r^3*rho(r) du
      */
-    double log_rmin = log(rmin);
-    double log_rmax = log(rmax);
-    double h = (log_rmax - log_rmin) / (double)N;
-
     double sum = 0.0;
     double rho_prev;
 
     /* First point: weight 1 */
-    double r0 = rmin;
-    double rho0 = rho(r0, Rs, a0, a1, a2, a3);
-    if (!isfinite(rho0) || rho0 <= 0.0) return -1.0;
-    sum += r0 * r0 * r0 * rho0;  /* r^3 * rho for log spacing */
-    rho_prev = rho0;
+    double rho_val = rho(grid->r[0], Rs, a0, a1, a2, a3);
+    if (!isfinite(rho_val) || rho_val <= 0.0) return -1.0;
+    sum += grid->r3[0] * rho_val;
+    rho_prev = rho_val;
 
-    /* Interior points */
-    for (int i = 1; i < N; i++) {
-        double u = log_rmin + i * h;
-        double r = exp(u);
-        double rho_val = rho(r, Rs, a0, a1, a2, a3);
-        if (!isfinite(rho_val) || rho_val <= 0.0) return -1.0;
-
-        /* Check monotonicity: density must decrease with radius */
-        if (rho_val > rho_prev) return -1.0;
+    /* Interior points: unrolled loop processing pairs (odd, even) */
+    for (int i = 1; i < SIMPSON_N; i += 2) {
+        /* Odd index: weight 4 */
+        rho_val = rho(grid->r[i], Rs, a0, a1, a2, a3);
+        if (!isfinite(rho_val) || rho_val <= 0.0 || rho_val > rho_prev)
+            return -1.0;
+        sum += 4.0 * grid->r3[i] * rho_val;
         rho_prev = rho_val;
 
-        double f = r * r * r * rho_val;  /* r^3 * rho for log spacing */
-
-        /* Odd indices: weight 4, Even indices: weight 2 */
-        if (i % 2 == 1) {
-            sum += 4.0 * f;
-        } else {
-            sum += 2.0 * f;
+        /* Even index: weight 2 (skip if this is the last point) */
+        if (i + 1 < SIMPSON_N) {
+            rho_val = rho(grid->r[i + 1], Rs, a0, a1, a2, a3);
+            if (!isfinite(rho_val) || rho_val <= 0.0 || rho_val > rho_prev)
+                return -1.0;
+            sum += 2.0 * grid->r3[i + 1] * rho_val;
+            rho_prev = rho_val;
         }
     }
 
     /* Last point: weight 1 */
-    double rn = rmax;
-    double rhon = rho(rn, Rs, a0, a1, a2, a3);
-    if (!isfinite(rhon) || rhon <= 0.0) return -1.0;
-    /* Check monotonicity for last point */
-    if (rhon > rho_prev) return -1.0;
-    sum += rn * rn * rn * rhon;  /* r^3 * rho for log spacing */
+    rho_val = rho(grid->r[SIMPSON_N], Rs, a0, a1, a2, a3);
+    if (!isfinite(rho_val) || rho_val <= 0.0 || rho_val > rho_prev)
+        return -1.0;
+    sum += grid->r3[SIMPSON_N] * rho_val;
 
     /* Simpson's factor and 4*pi for spherical integral */
-    double integral = (h / 3.0) * sum;
-    return 4.0 * PI * integral;
+    return (4.0 * PI * grid->h / 3.0) * sum;
 }
 
 
 double compute_loss(double* bin_counts, double* bin_positions, int nbin,
-                    int npart, double rmin, double rmax,
+                    int npart, const SimpsonGrid* grid,
                     DensityFunc rho,
                     double Rs, double a0, double a1, double a2, double a3) {
     /*
@@ -113,8 +120,7 @@ double compute_loss(double* bin_counts, double* bin_positions, int nbin,
     }
 
     /* Compute enclosed mass via Simpson integration */
-    double mass = simpson_mass(rho, rmin, rmax, SIMPSON_N,
-                               Rs, a0, a1, a2, a3);
+    double mass = simpson_mass(rho, grid, Rs, a0, a1, a2, a3);
 
     /* Invalid mass: return large loss */
     if (mass <= 0.0 || !isfinite(mass)) {

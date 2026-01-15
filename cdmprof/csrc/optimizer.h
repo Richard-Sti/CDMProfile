@@ -35,8 +35,7 @@ typedef struct {
     double* bin_positions;
     int nbin;
     int npart;
-    double rmin;
-    double rmax;
+    SimpsonGrid grid;  /* Precomputed Simpson integration grid */
     DensityFunc rho;
     int nparams;
 } ObjectiveData;
