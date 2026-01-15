@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Richard Stiskalek
+# Copyright (C) 2025 Richard Stiskalek
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the
 # Free Software Foundation; either version 3 of the License, or (at your
@@ -17,8 +17,9 @@ Utility functions for CDM profile analysis.
 """
 from pathlib import Path
 
-import h5py
 import numpy as np
+from h5py import File
+from tqdm import tqdm
 
 
 class HaloData:
@@ -72,7 +73,7 @@ class HaloData:
         """Get radii by halo ID."""
         return self.load(halo_id)
 
-    def bin(self, nbin, log=True, indices=None):
+    def bin(self, nbin, log=True, indices=None, verbose=True):
         """
         Bin particle radii into counts. Each halo is binned between its
         own rmin and rmax.
@@ -85,6 +86,8 @@ class HaloData:
             If True, use logarithmic bins. Default: True.
         indices : array-like, optional
             Indices of halos to bin (0 to n_halos-1). Default: all halos.
+        verbose : bool, optional
+            If True, show progress bar. Default: True.
 
         Returns
         -------
@@ -103,30 +106,46 @@ class HaloData:
 
         nhalo = len(indices)
         bin_counts = np.zeros((nhalo, nbin), dtype=np.int64)
-        bin_positions = np.zeros((nhalo, nbin), dtype=np.float64)
-        bin_edges = np.zeros((nhalo, nbin + 1), dtype=np.float64)
         rmin_arr = np.zeros(nhalo, dtype=np.float64)
         rmax_arr = np.zeros(nhalo, dtype=np.float64)
         npart = np.zeros(nhalo, dtype=np.int64)
 
-        for i, idx in enumerate(indices):
+        # Compute bin counts using direct indexing (faster than np.histogram)
+        iterator = tqdm(enumerate(indices), total=nhalo, desc="Binning",
+                        disable=not verbose)
+        for i, idx in iterator:
             radii = self.load_by_index(idx)
             rmin = radii.min()
             rmax = radii.max()
             rmin_arr[i] = rmin
             rmax_arr[i] = rmax
-
-            if log:
-                edges = np.logspace(np.log10(rmin), np.log10(rmax), nbin + 1)
-                positions = np.sqrt(edges[:-1] * edges[1:])
-            else:
-                edges = np.linspace(rmin, rmax, nbin + 1)
-                positions = 0.5 * (edges[:-1] + edges[1:])
-
-            bin_edges[i] = edges
-            bin_positions[i] = positions
-            bin_counts[i], _ = np.histogram(radii, bins=edges)
             npart[i] = len(radii)
+
+            # Direct bin index computation
+            if log:
+                log_min = np.log(rmin)
+                log_range = np.log(rmax) - log_min
+                bin_idx = ((np.log(radii) - log_min) * (nbin / log_range))
+            else:
+                bin_idx = (radii - rmin) * (nbin / (rmax - rmin))
+
+            bin_idx = np.clip(bin_idx.astype(np.int64), 0, nbin - 1)
+            bin_counts[i] = np.bincount(bin_idx, minlength=nbin)[:nbin]
+
+        # Vectorized computation of edges and positions
+        t = np.linspace(0, 1, nbin + 1)
+        if log:
+            log_rmin = np.log(rmin_arr)[:, None]
+            log_rmax = np.log(rmax_arr)[:, None]
+            bin_edges = np.exp(log_rmin + t * (log_rmax - log_rmin))
+            bin_positions = np.sqrt(bin_edges[:, :-1] * bin_edges[:, 1:])
+        else:
+            bin_edges = rmin_arr[:, None] + t * (rmax_arr - rmin_arr)[:, None]
+            bin_positions = 0.5 * (bin_edges[:, :-1] + bin_edges[:, 1:])
+
+        # Ensure exact boundary values (avoid floating-point drift)
+        bin_edges[:, 0] = rmin_arr
+        bin_edges[:, -1] = rmax_arr
 
         return {
             'bin_counts': bin_counts,
@@ -154,7 +173,6 @@ def load_from_folder(directory, verbose=True):
     -------
     HaloData
     """
-    from tqdm import tqdm
 
     directory = Path(directory)
 
@@ -194,7 +212,7 @@ def load_from_hdf5(filepath):
     -------
     HaloData
     """
-    with h5py.File(filepath, 'r') as f:
+    with File(filepath, 'r') as f:
         radii = f['radii'][:]
         halo_ids = f['halo_id'][:]
         offset = f['offset'][:]
@@ -212,7 +230,7 @@ def save_binned_halos(filepath, binned_data):
     binned_data : dict
         Output from bin_halos().
     """
-    with h5py.File(filepath, 'w') as f:
+    with File(filepath, 'w') as f:
         f.create_dataset('bin_counts', data=binned_data['bin_counts'])
         f.create_dataset('bin_positions', data=binned_data['bin_positions'])
         f.create_dataset('bin_edges', data=binned_data['bin_edges'])
@@ -236,7 +254,7 @@ def load_binned_halos(filepath):
     dict
         Same structure as bin_halos() output.
     """
-    with h5py.File(filepath, 'r') as f:
+    with File(filepath, 'r') as f:
         return {
             'bin_counts': f['bin_counts'][:],
             'bin_positions': f['bin_positions'][:],
