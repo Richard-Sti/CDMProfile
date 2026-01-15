@@ -4,3 +4,5 @@ local_config.toml
 results/
 data/
 __pycache__/
+settings.json
+notes.txt
