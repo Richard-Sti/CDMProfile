@@ -15,15 +15,13 @@
 """
 JIT-compiled fitting module for density profiles.
 """
-import multiprocessing as mp
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 from cffi import FFI
-from sympy import Abs, N, ccode, limit, oo, simplify, symbols, sympify
+from sympy import Abs, ccode, simplify, symbols, sympify
 
 from .symbolic import SympyParser
 
@@ -79,6 +77,47 @@ def _has_normalization_only_param(expr_str):
         return False
 
     return False
+
+
+def _detect_abs_wrapped_params(expr_str, parser=None):
+    """
+    Detect parameters that appear exactly wrapped in Abs().
+
+    Only detects exact patterns like Abs(a0), NOT Abs(a0 + 1).
+
+    Parameters
+    ----------
+    expr_str : str
+        Expression string.
+    parser : SympyParser, optional
+        Parser instance. If None, creates a new one.
+
+    Returns
+    -------
+    set
+        Set of parameter indices (0-3) that are wrapped in Abs().
+        E.g., "Abs(a0) + a1" returns {0}
+             "Abs(a0 + 1)" returns {} (not exact)
+    """
+    if parser is None:
+        parser = SympyParser()
+
+    try:
+        expr = parser.parse(expr_str)
+    except Exception:
+        return set()
+
+    abs_wrapped = set()
+
+    # Find all Abs() calls in the expression
+    for atom in expr.atoms(Abs):
+        arg = atom.args[0]  # The argument inside Abs()
+        # Check if the argument is exactly one of the free parameters
+        for i, param in enumerate(parser._free_params):
+            if arg == param:
+                abs_wrapped.add(i)
+
+    return abs_wrapped
 
 
 def is_bad_function(expr_str):
@@ -140,373 +179,6 @@ def load_equations(filepath):
 
 
 ###############################################################################
-#                         Asymptote handling                                  #
-###############################################################################
-
-
-def _parse_limit_value(limit_str):
-    """Try to parse a limit string as a numerical value."""
-    try:
-        return float(limit_str)
-    except ValueError:
-        try:
-            return float(N(sympify(limit_str)))
-        except Exception:
-            return None
-
-
-def load_asymptotes(asymp_path, limit_type):
-    """
-    Load asymptotes file and categorize each function.
-
-    File format: `idx limit equation`
-
-    Parameters
-    ----------
-    asymp_path : str or Path
-        Path to asymptotes file.
-    limit_type : str
-        Either "inf" (x->inf, need limit=0) or "zero" (x->0+, need limit>0)
-
-    Returns
-    -------
-    dict
-        Dictionary mapping func_idx -> (category, limit_expr_str)
-    """
-    asymp_path = Path(asymp_path)
-    if not asymp_path.exists():
-        return {}
-
-    param_pattern = re.compile(r'\ba[0-3]\b')
-    asymp_dict = {}
-
-    with open(asymp_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-
-            parts = line.split(None, 2)
-            if len(parts) < 2:
-                continue
-
-            idx = int(parts[0])
-            limit_str = parts[1]
-
-            # Handle special cases first
-            if limit_str == "unknown":
-                asymp_dict[idx] = ("unknown", limit_str)
-                continue
-
-            if param_pattern.search(limit_str):
-                asymp_dict[idx] = ("param_dep", limit_str)
-                continue
-
-            # Categorize based on limit type
-            if limit_type == "inf":
-                # For x->inf: need limit = 0
-                if limit_str in ("oo", "-oo", "zoo", "inf", "-inf"):
-                    asymp_dict[idx] = ("skip_inf", limit_str)
-                elif limit_str == "0":
-                    asymp_dict[idx] = ("ok", limit_str)
-                else:
-                    val = _parse_limit_value(limit_str)
-                    if val is None:
-                        asymp_dict[idx] = ("unknown", limit_str)
-                    elif np.isclose(val, 0):
-                        asymp_dict[idx] = ("ok", limit_str)
-                    else:
-                        asymp_dict[idx] = ("skip_const", limit_str)
-            else:
-                # For x->0+: need limit > 0
-                if limit_str == "0":
-                    asymp_dict[idx] = ("skip_zero", limit_str)
-                elif limit_str in ("-oo", "-inf"):
-                    asymp_dict[idx] = ("skip_neg", limit_str)
-                elif limit_str in ("oo", "zoo", "inf"):
-                    asymp_dict[idx] = ("ok", limit_str)
-                else:
-                    val = _parse_limit_value(limit_str)
-                    if val is None:
-                        asymp_dict[idx] = ("unknown", limit_str)
-                    elif val <= 0:
-                        asymp_dict[idx] = ("skip_neg", limit_str)
-                    else:
-                        asymp_dict[idx] = ("ok", limit_str)
-
-    return asymp_dict
-
-
-def load_asymptotes_inf(asymp_path):
-    """Load x->inf asymptotes. Wrapper for backwards compatibility."""
-    return load_asymptotes(asymp_path, "inf")
-
-
-def load_asymptotes_zero(asymp_path):
-    """Load x->0+ asymptotes. Wrapper for backwards compatibility."""
-    return load_asymptotes(asymp_path, "zero")
-
-
-def evaluate_asymptote(limit_expr_str, params):
-    """
-    Evaluate a parameter-dependent asymptotic limit with fitted parameters.
-
-    Parameters
-    ----------
-    limit_expr_str : str
-        Symbolic expression for the limit (e.g., "a0 - 1").
-    params : array-like
-        Fitted parameters [Rs, a0, a1, a2, a3].
-
-    Returns
-    -------
-    float or None
-        Evaluated limit value, or None if evaluation fails.
-    """
-    try:
-        param_symbols = [symbols(f'a{i}', real=True) for i in range(4)]
-
-        local_dict = {f'a{i}': param_symbols[i] for i in range(4)}
-        expr = sympify(limit_expr_str, locals=local_dict)
-
-        # Substitute fitted values (params[0] is Rs, params[1:] are a0-a3)
-        subs_dict = {}
-        for i in range(4):
-            if i + 1 < len(params):
-                subs_dict[param_symbols[i]] = params[i + 1]
-            else:
-                subs_dict[param_symbols[i]] = 1.0
-
-        result = expr.subs(subs_dict)
-        return float(N(result))
-
-    except Exception:
-        return None
-
-
-def check_asymptote_inf(value, tol=1e-6):
-    """
-    Check if an evaluated x->inf asymptote is acceptable (effectively zero).
-
-    Parameters
-    ----------
-    value : float or None
-        Evaluated asymptote value.
-    tol : float
-        Tolerance for considering a value as zero.
-
-    Returns
-    -------
-    bool
-        True if value is effectively zero, False otherwise.
-    """
-    if value is None:
-        return False
-    return abs(value) < tol
-
-
-def check_asymptote_zero(value):
-    """
-    Check if an evaluated x->0+ asymptote is acceptable (positive).
-
-    Parameters
-    ----------
-    value : float or None
-        Evaluated asymptote value.
-
-    Returns
-    -------
-    bool
-        True if value is positive, False otherwise.
-    """
-    if value is None:
-        return False
-    return value > 0
-
-
-def _numerical_limit(expr, x, direction):
-    """
-    Compute limit using sympy's limit function.
-
-    Parameters
-    ----------
-    expr : sympy expression
-        Expression with numerical coefficients.
-    x : sympy symbol
-        The variable.
-    direction : str
-        '0+' for x->0+ or 'inf' for x->inf.
-
-    Returns
-    -------
-    float or None
-        The limit value, or None if computation fails.
-    """
-    # print("This is 1")
-    try:
-        if direction == '0+':
-            result = limit(expr, x, 1e-16, '+')
-        else:
-            result = limit(expr, x, oo)
-        return float(result.evalf())
-    except Exception:
-        return None
-
-
-def _compute_limit_worker(expr_str, result_queue):
-    """Worker function for subprocess-based limit computation."""
-    # print("this is B")
-    try:
-        x = symbols('x', positive=True)
-        expr = sympify(expr_str, locals={'x': x})
-
-        try:
-            lim_zero = float(limit(expr, x, 1e-16, '+').evalf())
-        except Exception:
-            lim_zero = None
-
-        try:
-            lim_inf = float(limit(expr, x, oo).evalf())
-        except Exception:
-            lim_inf = None
-
-        result_queue.put(('success', lim_zero, lim_inf))
-    except Exception:
-        result_queue.put(('error', None, None))
-
-
-def compute_asymptotes_with_params(expr_str, params, round_decimals=5,
-                                   timeout=0):
-    """
-    Compute asymptotes of an expression with concrete parameter values.
-
-    Substitutes numerical values first, then computes the limits.
-    Sympy automatically simplifies Abs() when values are known.
-
-    Parameters
-    ----------
-    expr_str : str
-        The density profile expression (e.g., "pow(Abs(a0 - x), a1)").
-    params : array-like
-        Fitted parameters [Rs, a0, a1, a2, a3].
-    round_decimals : int, optional
-        Round parameters to this many decimal places to avoid sympy
-        creating huge rational expressions. Default is 5.
-    timeout : int, optional
-        Timeout in seconds. If 0, no timeout. Uses subprocess for MPI safety.
-
-    Returns
-    -------
-    tuple
-        (lim_zero, lim_inf) where each is float or None if computation fails.
-    """
-    # print(f"Computing asymptotes for expression: {expr_str}")
-    # print(f"With parameters: {params}")
-    try:
-        parser = SympyParser()
-        expr = parser.parse(expr_str)
-        x = parser._x
-
-        # Substitute numerical values using N() to force numerical evaluation
-        subs_dict = {
-            parser._free_params[i]: N(round(params[i + 1], round_decimals))
-            for i in range(min(len(params) - 1, 4))
-        }
-        expr_numerical = expr.subs(subs_dict)
-
-        # Use subprocess timeout if requested (MPI-safe)
-        if timeout > 0:
-            ctx = mp.get_context('spawn')
-            result_queue = ctx.Queue()
-
-            proc = ctx.Process(
-                target=_compute_limit_worker,
-                args=(str(expr_numerical), result_queue)
-            )
-            proc.start()
-            proc.join(timeout=timeout)
-
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=1)
-                if proc.is_alive():
-                    proc.kill()
-                    proc.join()
-                return None, None
-
-            try:
-                status, lim_zero, lim_inf = result_queue.get_nowait()
-                if status == 'success':
-                    return lim_zero, lim_inf
-                return None, None
-            except Exception:
-                return None, None
-
-        # Try numerical evaluation first (much faster)
-        # print(expr_numerical)
-        # print("A")
-        lim_zero = _numerical_limit(expr_numerical, x, '0+')
-        # print("B")
-        lim_inf = _numerical_limit(expr_numerical, x, 'inf')
-        # print("C")
-
-        return lim_zero, lim_inf
-
-    except Exception:
-        return None, None
-
-
-def process_asymptotes(asymp_inf_path, asymp_zero_path):
-    """
-    Load and process both asymptote files, returning skip sets and info.
-
-    Parameters
-    ----------
-    asymp_inf_path : str or Path
-        Path to asymptotes_inf_{comp}.txt file.
-    asymp_zero_path : str or Path
-        Path to asymptotes_zero_{comp}.txt file.
-
-    Returns
-    -------
-    tuple
-        (skip_dict, asymp_inf_param_dep, asymp_zero_param_dep, asymp_unknown)
-        - skip_dict: dict mapping func_idx -> reason for pre-fit skipping
-        - asymp_inf_param_dep: dict mapping func_idx -> limit_expr for x->inf
-        - asymp_zero_param_dep: dict mapping func_idx -> limit_expr for x->0+
-        - asymp_unknown: set of func_idx needing post-fit asymptote computation
-    """
-    skip_dict = {}
-    asymp_inf_param_dep = {}
-    asymp_zero_param_dep = {}
-    asymp_unknown = set()
-
-    # Process x->inf asymptotes
-    asymp_inf = load_asymptotes_inf(asymp_inf_path)
-    for idx, (category, limit_str) in asymp_inf.items():
-        if category.startswith("skip_"):
-            skip_dict[idx] = f"asymp_inf_{category}"
-        elif category == "param_dep":
-            asymp_inf_param_dep[idx] = limit_str
-        elif category == "unknown":
-            asymp_unknown.add(idx)
-
-    # Process x->0+ asymptotes
-    asymp_zero = load_asymptotes_zero(asymp_zero_path)
-    for idx, (category, limit_str) in asymp_zero.items():
-        if category.startswith("skip_"):
-            # Don't override if already skipped
-            if idx not in skip_dict:
-                skip_dict[idx] = f"asymp_zero_{category}"
-        elif category == "param_dep":
-            asymp_zero_param_dep[idx] = limit_str
-        elif category == "unknown":
-            asymp_unknown.add(idx)
-
-    return skip_dict, asymp_inf_param_dep, asymp_zero_param_dep, asymp_unknown
-
-
-###############################################################################
 #                         C code compilation                                  #
 ###############################################################################
 
@@ -541,7 +213,7 @@ def _get_nlopt_paths():
         return [], []
 
 
-def compile_fitter(expr_str, parser=None):
+def compile_fitter(expr_str, parser=None, simpson_n=512):
     """
     JIT compile a density function + loss + optimizer.
 
@@ -552,6 +224,10 @@ def compile_fitter(expr_str, parser=None):
         (e.g., "1 / (x * (1 + x)**a0)")
     parser : SympyParser, optional
         Parser instance. If None, creates a new one.
+    simpson_n : int, optional
+        Number of intervals for Simpson integration. Must be even.
+        Higher values give more accuracy but slower computation.
+        Default: 512.
 
     Returns
     -------
@@ -564,10 +240,17 @@ def compile_fitter(expr_str, parser=None):
     if parser is None:
         parser = SympyParser()
 
+    # Validate simpson_n
+    if simpson_n % 2 != 0:
+        raise ValueError(f"simpson_n must be even, got {simpson_n}")
+
     # Parse expression and count parameters
     expr = parser.parse(expr_str)
     nfree = parser.count_free(expr)
     nparams = 1 + nfree  # Rs + free parameters
+
+    # Detect parameters wrapped in Abs() for automatic positive bounds
+    abs_wrapped_params = _detect_abs_wrapped_params(expr_str, parser)
 
     # Generate C code for density function
     expr_substituted = expr.subs(parser._x, parser._r / parser._Rs)
@@ -580,11 +263,13 @@ def compile_fitter(expr_str, parser=None):
     optimizer_c = _read_csrc('optimizer.c')
 
     # Generate density function C code (only dynamic part)
+    # Use __attribute__((always_inline)) for GCC/Clang to ensure inlining
     rho_func_c = f"""
 /* Auto-generated density function */
 /* Expression: {expr_str} */
-static double rho_func(double r, double Rs,
-                       double a0, double a1, double a2, double a3) {{
+static inline __attribute__((always_inline))
+double rho_func(double r, double Rs,
+                double a0, double a1, double a2, double a3) {{
     (void)a0; (void)a1; (void)a2; (void)a3;  /* Suppress unused warnings */
     return {c_expr};
 }}
@@ -598,23 +283,29 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                          int nparams, double* initial_params,
                          double* lower_bounds, double* upper_bounds,
                          double xtol, double ftol, int maxeval,
+                         int optimizer_type,
                          double* out_params, double* out_loss,
                          int* out_converged, int* out_neval) {
     fit_profile(bin_counts, bin_positions, nbin, npart, rmin, rmax,
                 rho_func, nparams, initial_params,
                 lower_bounds, upper_bounds,
                 xtol, ftol, maxeval,
+                optimizer_type,
                 out_params, out_loss, out_converged, out_neval);
 }
 """
 
     # Combine: headers -> rho_func -> implementations -> wrapper
+    # Inject SIMPSON_N before loss.h to override the default
     full_c_source = f"""
 #include <math.h>
 #include <float.h>
 #include <stdlib.h>
 #include <string.h>
 #include <nlopt.h>
+
+/* Simpson integration grid size (injected from Python config) */
+#define SIMPSON_N {simpson_n}
 
 /* ===== loss.h ===== */
 {loss_h}
@@ -643,6 +334,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                              int nparams, double* initial_params,
                              double* lower_bounds, double* upper_bounds,
                              double xtol, double ftol, int maxeval,
+                             int optimizer_type,
                              double* out_params, double* out_loss,
                              int* out_converged, int* out_neval);
     """
@@ -658,12 +350,20 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         libraries=["m", "nlopt"],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
+        extra_compile_args=["-O3", "-ffast-math", "-march=native"],
     )
+
+    # Optimizer type mapping
+    OPTIMIZER_MAP = {
+        'neldermead': 0,
+        'nelder-mead': 0,
+        'bobyqa': 1,
+    }
 
     # Create Python wrapper
     def fit(bin_counts, bin_positions, rmin, rmax,
             initial_params=None, lower_bounds=None, upper_bounds=None,
-            xtol=1e-6, ftol=1e-6, maxeval=1000):
+            xtol=1e-6, ftol=1e-6, maxeval=1000, optimizer='neldermead'):
         """
         Fit the density profile to binned halo data.
 
@@ -689,6 +389,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
             Relative tolerance on function value.
         maxeval : int, optional
             Maximum function evaluations.
+        optimizer : str, optional
+            Optimizer to use: 'neldermead' or 'bobyqa'. Default: 'neldermead'.
 
         Returns
         -------
@@ -726,6 +428,9 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         out_converged = np.zeros(1, dtype=np.int32)
         out_neval = np.zeros(1, dtype=np.int32)
 
+        # Convert optimizer string to int
+        optimizer_type = OPTIMIZER_MAP.get(optimizer.lower(), 0)
+
         lib.fit_profile_wrapper(
             ffi.cast("double*", bin_counts.ctypes.data),
             ffi.cast("double*", bin_positions.ctypes.data),
@@ -734,6 +439,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
             ffi.cast("double*", lower_bounds.ctypes.data),
             ffi.cast("double*", upper_bounds.ctypes.data),
             xtol, ftol, maxeval,
+            optimizer_type,
             ffi.cast("double*", out_params.ctypes.data),
             ffi.cast("double*", out_loss.ctypes.data),
             ffi.cast("int*", out_converged.ctypes.data),
@@ -748,11 +454,13 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         }
 
     def fit_with_restarts(bin_counts, bin_positions, rmin, rmax,
-                          max_restarts=50, nconv_required=5, conv_rtol=1e-4,
+                          max_restarts=50, nconv_required=5,
+                          conv_rtol=1e-3, conv_atol=10,
                           param_bounds=None,
                           Rs_lower_factor=0.25, Rs_upper_factor=10.0,
                           a_lower=-500.0, a_upper=500.0,
-                          xtol=1e-6, ftol=1e-6, maxeval=5000, seed=None):
+                          xtol=1e-6, ftol=1e-6, maxeval=5000, seed=None,
+                          optimizer='neldermead'):
         """
         Fit with multiple random restarts and early stopping.
 
@@ -777,7 +485,10 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
             Default: 5.
         conv_rtol : float, optional
             Relative tolerance for considering two losses as converged to
-            the same minimum. Default: 1e-4.
+            the same minimum. Default: 1e-3.
+        conv_atol : float, optional
+            Absolute tolerance for considering two losses as converged to
+            the same minimum. Default: 10.
         param_bounds : list of tuples, optional
             Bounds [(low, high), ...] for sampling and optimization.
             If None, uses Rs_lower/upper_factor and a_lower/upper.
@@ -797,6 +508,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
             Maximum function evaluations per restart.
         seed : int, optional
             Random seed for reproducibility.
+        optimizer : str, optional
+            Optimizer to use: 'neldermead' or 'bobyqa'. Default: 'neldermead'.
 
         Returns
         -------
@@ -814,8 +527,12 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
 
         if param_bounds is None:
             param_bounds = [(rmin * Rs_lower_factor, rmax * Rs_upper_factor)]
-            for _ in range(nfree):
-                param_bounds.append((a_lower, a_upper))
+            for i in range(nfree):
+                # If parameter is wrapped in Abs(), only need positive values
+                if i in abs_wrapped_params:
+                    param_bounds.append((0.0, a_upper))
+                else:
+                    param_bounds.append((a_lower, a_upper))
 
         lower_bounds = np.array([b[0] for b in param_bounds], dtype=np.float64)
         upper_bounds = np.array([b[1] for b in param_bounds], dtype=np.float64)
@@ -827,10 +544,10 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         nconv = 0  # Number of times converged to current best
         nrestart_used = 0
 
-        for _ in range(max_restarts):
+        for restart_idx in range(max_restarts):
             nrestart_used += 1
 
-            # Generate random initial parameters
+            # Generate initial parameters (uniform sampling)
             initial_params = np.zeros(nparams, dtype=np.float64)
             for i, (low, high) in enumerate(param_bounds):
                 if i == 0:
@@ -844,7 +561,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                          initial_params=initial_params,
                          lower_bounds=lower_bounds,
                          upper_bounds=upper_bounds,
-                         xtol=xtol, ftol=ftol, maxeval=maxeval)
+                         xtol=xtol, ftol=ftol, maxeval=maxeval,
+                         optimizer=optimizer)
 
             total_neval += result['neval']
 
@@ -852,8 +570,11 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
             if result['loss'] >= 1e29:
                 continue
 
+            # Convergence tolerance: atol + rtol * |best_loss|
+            tol = conv_atol + conv_rtol * abs(best_loss)
+
             # Found significantly better minimum? Reset convergence counter
-            if result['loss'] < best_loss * (1 - conv_rtol):
+            if result['loss'] < best_loss - tol:
                 nconv = 0
 
             # Update best if this is better
@@ -862,8 +583,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                 best_params = result['params'].copy()
                 best_converged = result['converged']
 
-            # Converged to same minimum (within relative tolerance)?
-            if abs(result['loss'] - best_loss) <= conv_rtol * abs(best_loss):
+            # Converged to same minimum (within tolerance)?
+            if abs(result['loss'] - best_loss) <= tol:
                 nconv += 1
 
             # Early stopping: converged enough times to the same minimum
@@ -891,6 +612,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
     fit.expr_str = expr_str
     fit.nparams = nparams
     fit.nfree = nfree
+    fit.abs_wrapped_params = abs_wrapped_params
     fit.fit_with_restarts = fit_with_restarts
 
     return fit
