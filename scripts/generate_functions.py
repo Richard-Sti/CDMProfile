@@ -16,17 +16,18 @@
 Generate functions of a given complexity for a run.
 """
 import os
+import re
 from argparse import ArgumentParser
 from os import listdir, makedirs
 from os.path import abspath, dirname, exists, isfile, join
 from shutil import move
 
-import numpy as np
+import cdmprof
 import esr.generation.duplicate_checker  # noqa
 import esr.generation.generator as generator  # noqa
+import numpy as np
 from mpi4py import MPI
 
-import cdmprof
 from utils import read_config
 
 
@@ -37,7 +38,6 @@ def generate_functions(runname, comp):
 
 def _has_x_dependence(expr_str):
     """Check if expression contains 'x' as a variable (not part of 'exp')."""
-    import re
     # Remove 'exp' to avoid false positives, then check for 'x'
     cleaned = re.sub(r'exp', '', expr_str)
     return 'x' in cleaned
@@ -81,7 +81,7 @@ def _compute_asymptote(idx, eq, verbose=False, rank=0):
     tuple
         (idx, eq, lim_zero, lim_inf) where limits are strings.
     """
-    from sympy import symbols, limit, oo, sympify
+    from sympy import limit, oo, symbols, sympify
 
     x = symbols('x', positive=True)
     # Don't assume sign for parameters - fitter allows [-500, 500]
@@ -141,7 +141,6 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
     dict
         Dictionary with asymptote statistics (only for non-skipped functions).
     """
-    import re
     param_pattern = re.compile(r'\ba[0-3]\b')
 
     if skip_idx is None:
@@ -261,7 +260,7 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
                 except ValueError:
                     # Try sympify + N for symbolic constants
                     try:
-                        from sympy import sympify, N
+                        from sympy import N, sympify
                         val = float(N(sympify(lim_zero)))
                     except Exception:
                         val = None
@@ -298,7 +297,7 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
                 except ValueError:
                     # Try sympify + N for symbolic constants
                     try:
-                        from sympy import sympify, N
+                        from sympy import N, sympify
                         val = float(N(sympify(lim_inf)))
                     except Exception:
                         val = None
