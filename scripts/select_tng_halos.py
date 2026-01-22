@@ -53,13 +53,20 @@ def load_group_catalog(basepath, snap_num):
     subhalo_fields = [
         'SubhaloPos',
         'SubhaloMass',
-        'SubhaloFlag',
         'SubhaloLenType',
     ]
 
     groups = il.groupcat.loadHalos(basepath, snap_num, fields=group_fields)
     subhalos = il.groupcat.loadSubhalos(basepath, snap_num,
                                         fields=subhalo_fields)
+
+    # SubhaloFlag only exists in full-physics runs, try to load separately
+    try:
+        flag_data = il.groupcat.loadSubhalos(basepath, snap_num,
+                                             fields=['SubhaloFlag'])
+        subhalos['SubhaloFlag'] = flag_data['SubhaloFlag']
+    except Exception:
+        subhalos['SubhaloFlag'] = None
 
     return groups, subhalos
 
