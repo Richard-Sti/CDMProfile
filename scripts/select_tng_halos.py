@@ -70,17 +70,34 @@ def load_group_catalog(basepath, snap_num):
     groups = {field: [] for field in group_fields}
     subhalos = {field: [] for field in subhalo_fields}
 
+    # Track cumulative subhalo count for offsetting GroupFirstSub
+    subhalo_offset = 0
+
     for fpath in chunk_files:
         with h5py.File(fpath, 'r') as f:
-            if 'Group' in f:
-                for field in group_fields:
-                    if field in f['Group']:
-                        groups[field].append(f['Group'][field][:])
+            n_subhalos_chunk = 0
 
             if 'Subhalo' in f:
                 for field in subhalo_fields:
                     if field in f['Subhalo']:
-                        subhalos[field].append(f['Subhalo'][field][:])
+                        data = f['Subhalo'][field][:]
+                        subhalos[field].append(data)
+                        if field == 'SubhaloPos':
+                            n_subhalos_chunk = len(data)
+
+            if 'Group' in f:
+                for field in group_fields:
+                    if field in f['Group']:
+                        data = f['Group'][field][:]
+                        # Offset GroupFirstSub to make it a global index
+                        if field == 'GroupFirstSub':
+                            # Only offset valid indices (>= 0)
+                            data = data.copy()
+                            valid = data >= 0
+                            data[valid] += subhalo_offset
+                        groups[field].append(data)
+
+            subhalo_offset += n_subhalos_chunk
 
     for field in group_fields:
         if len(groups[field]) > 0:
