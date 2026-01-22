@@ -13,7 +13,7 @@
 #   --resume   : Optional flag to resume from existing results
 #
 
-memory=7
+memory=3
 queue="berg"
 
 on_login=${1}
