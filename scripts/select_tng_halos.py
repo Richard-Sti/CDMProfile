@@ -25,6 +25,7 @@ Selection criteria:
 After selection, extracts DM particles within R200c (positions and radii).
 Supports MPI parallelization for particle extraction.
 """
+import tomllib
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -33,6 +34,22 @@ import illustris_python as il
 import numpy as np
 from mpi4py import MPI
 from scipy.spatial import cKDTree
+
+
+def load_local_config():
+    """Load local_config.toml from the project root."""
+    script_dir = Path(__file__).resolve().parent
+    project_dir = script_dir.parent
+    config_path = project_dir / "local_config.toml"
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"local_config.toml not found at {config_path}. "
+            "Please create it with [path] section containing 'data' key."
+        )
+
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
 
 
 ###############################################################################
@@ -507,7 +524,7 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
         all_radii = np.linalg.norm(all_pos, axis=1)
 
         # Save to HDF5
-        output_file = output_dir / "particles.hdf5"
+        output_file = output_dir / f"particles_{args.snap:03d}.hdf5"
         with h5py.File(output_file, 'w') as f:
             # Particle data
             f.create_dataset("halo_id", data=halo_ids)
@@ -554,8 +571,6 @@ def main():
                         help="Path to TNG output directory")
     parser.add_argument("--snap", type=int, default=99,
                         help="Snapshot number (default: 99)")
-    parser.add_argument("--output-tag", type=str, default=None,
-                        help="Output folder name")
     parser.add_argument("--min-mass", type=float, default=1e11,
                         help="Minimum M200c in Msun/h (default: 1e11)")
     parser.add_argument("--max-offset", type=float, default=0.07,
@@ -624,18 +639,20 @@ def main():
     if not args.extract:
         return
 
-    # Construct output path
-    if args.output_tag is None:
-        output_tag = f"halo_particles_{args.snap:03d}"
-    else:
-        output_tag = args.output_tag
-    output_dir = Path(args.basepath).parent / "preprocessing" / output_tag
-
+    # Get output directory from local_config.toml
     if rank == 0:
+        config = load_local_config()
+        data_dir = Path(config["path"]["data"])
+        output_dir = data_dir / "tng_particles"
+        output_dir.mkdir(parents=True, exist_ok=True)
         print(f"\nOutput directory: {output_dir}")
         if args.subsample is not None:
             print(f"  Subsampling to {args.subsample} particles per halo "
                   f"(seed={args.seed})")
+    else:
+        output_dir = None
+
+    output_dir = comm.bcast(output_dir, root=0)
 
     extract_halo_particles_mpi(
         args.basepath, args.snap, groups, subhalos,
