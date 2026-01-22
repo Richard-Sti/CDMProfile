@@ -55,7 +55,7 @@ min_mass=1e11               # Msun/h
 max_offset=0.07             # Fraction of R200c
 max_satellite_ratio=0.1     # Max satellite/central mass ratio
 isolation_distance=5.0      # In units of R200c
-isolation_mass_ratio=1.0    # Reject if neighbor > ratio * M_self
+isolation_mass_ratio=0.1    # Reject if neighbor > ratio * M_self
 subsample=""                # Set to e.g. 10000 to subsample particles
 seed=42                     # Random seed for subsampling
 
