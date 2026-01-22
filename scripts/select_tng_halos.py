@@ -403,7 +403,7 @@ def load_dm_particles_for_halo(basepath, snap_num, halo_id, center, radius,
 
 
 def check_decreasing_outer_profile(pos, r200c, r_min_frac=0.6, r_max_frac=1.0,
-                                    n_bins=10):
+                                   n_bins=10):
     """
     Check if particle density decreases on average in outer radial bins.
 
@@ -442,7 +442,7 @@ def check_decreasing_outer_profile(pos, r200c, r_min_frac=0.6, r_max_frac=1.0,
 
     # Compute density (counts / shell volume, proportional to r^2 * dr)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    shell_volumes = bin_edges[1:]**3 - bin_edges[:-1]**3  # proportional to volume
+    shell_volumes = bin_edges[1:]**3 - bin_edges[:-1]**3  # proportional to V
     density = counts / shell_volumes
 
     # Only fit bins with non-zero counts
