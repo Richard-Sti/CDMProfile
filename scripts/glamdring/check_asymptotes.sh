@@ -83,15 +83,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-mpicm="mpirun -n $nprocs $pythoncm"
-
 if [ "$on_login" -eq 1 ]; then
+    cm="mpirun -n $nprocs $pythoncm"
     echo "Running locally:"
-    echo $mpicm
+    echo $cm
     echo
-    eval $mpicm
+    eval $cm
 else
-    cm="addqueue -q $queue -n $nprocs -m $memory $mpicm"
+    cm="addqueue -q $queue -n $nprocs -m $memory $pythoncm"
     echo "Submitting:"
     echo $cm
     echo
