@@ -489,3 +489,112 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
     fit.fit_with_restarts = fit_with_restarts
 
     return fit
+
+
+###############################################################################
+#                      Convenience NFW fitting function                       #
+###############################################################################
+
+
+# Cache for compiled NFW fitter
+_nfw_fitter_cache = {}
+
+
+def fit_nfw(radii, nbin=50, rmin=None, rmax=None, log_bins=True,
+            max_restarts=50, nconv_required=5, seed=None, simpson_n=512,
+            **kwargs):
+    """
+    Fit NFW profile to particle radii.
+
+    The NFW density profile is: rho(r) = rho_s / ((r/r_s) * (1 + r/r_s)^2)
+
+    Parameters
+    ----------
+    radii : array-like
+        Particle radii from halo center.
+    nbin : int, optional
+        Number of radial bins. Default: 50.
+    rmin, rmax : float, optional
+        Radial range for binning. Default: min/max of radii.
+    log_bins : bool, optional
+        Use logarithmic bins. Default: True.
+    max_restarts : int, optional
+        Maximum optimizer restarts. Default: 50.
+    nconv_required : int, optional
+        Number of convergences to same minimum required. Default: 5.
+    seed : int, optional
+        Random seed for reproducibility.
+    simpson_n : int, optional
+        Number of points for Simpson integration. Default: 512.
+    **kwargs
+        Additional arguments passed to fit_with_restarts().
+
+    Returns
+    -------
+    dict with keys:
+        rs : float
+            Scale radius (same units as input radii).
+        loss : float
+            Best-fit loss value.
+        converged : bool
+            Whether optimizer converged.
+        confirmed : bool
+            Whether minimum was confirmed by multiple restarts.
+        params : ndarray
+            Raw parameters [Rs].
+        neval : int
+            Total number of function evaluations.
+    """
+    radii = np.asarray(radii)
+
+    if rmin is None:
+        rmin = radii.min()
+    if rmax is None:
+        rmax = radii.max()
+
+    # Bin the radii
+    if log_bins:
+        bin_edges = np.logspace(np.log10(rmin), np.log10(rmax), nbin + 1)
+    else:
+        bin_edges = np.linspace(rmin, rmax, nbin + 1)
+
+    bin_counts, _ = np.histogram(radii, bins=bin_edges)
+
+    # Bin centers (geometric mean for log bins, arithmetic for linear)
+    if log_bins:
+        bin_positions = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+    else:
+        bin_positions = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    # Get or compile NFW fitter
+    cache_key = simpson_n
+    if cache_key not in _nfw_fitter_cache:
+        # NFW: rho = 1 / (x * (1 + x)^2) where x = r/Rs
+        _nfw_fitter_cache[cache_key] = compile_fitter(
+            "1/(x*(1+x)**2)", simpson_n=simpson_n)
+
+    fitter = _nfw_fitter_cache[cache_key]
+
+    # Fit
+    result = fitter.fit_with_restarts(
+        bin_counts.astype(np.float64),
+        bin_positions,
+        rmin, rmax,
+        max_restarts=max_restarts,
+        nconv_required=nconv_required,
+        seed=seed,
+        **kwargs
+    )
+
+    # Extract scale radius
+    rs = result['params'][0] if result['params'] is not None else np.nan
+
+    return {
+        'rs': rs,
+        'loss': result['loss'],
+        'converged': result['converged'],
+        'confirmed': result['confirmed'],
+        'params': result['params'],
+        'neval': result['neval'],
+        'nrestart_used': result['nrestart_used'],
+    }
