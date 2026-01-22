@@ -32,6 +32,7 @@ import h5py
 import illustris_python as il
 import numpy as np
 from mpi4py import MPI
+from scipy.spatial import cKDTree
 
 
 ###############################################################################
@@ -195,14 +196,12 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
 
     Uses scipy KD-tree for efficient spatial queries.
     """
-    from scipy.spatial import cKDTree
-
     mask = pre_mask.copy()
     n_groups = len(groups['Group_M_Crit200'])
     candidates = np.where(pre_mask)[0]
 
     if len(candidates) == 0:
-        print(f"  Isolation cut: 0/0 pass (no candidates)")
+        print("  Isolation cut: 0/0 pass (no candidates)")
         return mask
 
     group_pos = groups['GroupPos']
@@ -227,7 +226,8 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
     # Pre-filter groups by mass (only keep potentially problematic neighbors)
     massive_groups_mask = M200 > min_mass_threshold
     massive_group_indices = np.where(massive_groups_mask)[0]
-    print(f"    {len(massive_group_indices)} massive groups after pre-filtering")
+    print(
+        f"    {len(massive_group_indices)} massive groups after pre-filtering")
 
     # Build KD-tree for massive groups
     if len(massive_group_indices) > 0:
@@ -333,6 +333,24 @@ def print_selection_summary(groups, subhalos, selected_indices):
     print(f"  DM particles:   min={npart.min()}, "
           f"median={int(np.median(npart))}, max={npart.max()}")
     print(f"  Total DM particles: {npart.sum():,}")
+
+    # Mass histogram in log bins
+    log_M200 = np.log10(M200)
+    bin_width = 0.2
+    bin_edges = np.arange(
+        np.floor(log_M200.min() / bin_width) * bin_width,
+        np.ceil(log_M200.max() / bin_width) * bin_width + bin_width,
+        bin_width
+    )
+    counts, _ = np.histogram(log_M200, bins=bin_edges)
+
+    print("\n  Mass distribution (log10 M200c [Msun/h]):")
+    for i, count in enumerate(counts):
+        if count > 0:
+            bin_lo = bin_edges[i]
+            bin_hi = bin_edges[i + 1]
+            print(f"    [{bin_lo:.1f}, {bin_hi:.1f}): {count:6d}")
+
     print("=" * 70)
 
 
