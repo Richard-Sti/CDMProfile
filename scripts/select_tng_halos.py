@@ -153,8 +153,14 @@ def apply_offset_cut(groups, subhalos, max_offset_frac):
 def apply_cosmological_origin_cut(groups, subhalos):
     """Select groups whose central subhalo has SubhaloFlag == 1."""
     n_groups = len(groups['Group_M_Crit200'])
-    mask = np.zeros(n_groups, dtype=bool)
 
+    # SubhaloFlag only exists in full-physics runs. In DM-only runs,
+    # all subhalos are cosmological by definition.
+    if subhalos['SubhaloFlag'] is None:
+        print("  Cosmological origin cut: skipped (DM-only run)")
+        return np.ones(n_groups, dtype=bool)
+
+    mask = np.zeros(n_groups, dtype=bool)
     subhalo_flag = subhalos['SubhaloFlag']
     first_sub = groups['GroupFirstSub']
     n_subs = groups['GroupNsubs']
