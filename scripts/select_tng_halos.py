@@ -116,83 +116,100 @@ def load_snapshot_header(basepath, snap_num):
 ###############################################################################
 
 
-def apply_mass_cut(groups, min_mass):
+def apply_mass_cut(groups, min_mass, pre_mask):
     """Select groups above minimum mass (min_mass in Msun/h)."""
     M200 = groups['Group_M_Crit200'] * 1e10  # Convert to Msun/h
-    mask = M200 > min_mass
+    mask = pre_mask & (M200 > min_mass)
     print(f"  Mass cut (M200 > {min_mass:.2e} Msun/h): "
-          f"{mask.sum()}/{len(mask)} groups pass")
+          f"{mask.sum()}/{pre_mask.sum()} pass")
     return mask
 
 
-def apply_offset_cut(groups, subhalos, max_offset_frac):
+def apply_offset_cut(groups, subhalos, max_offset_frac, pre_mask):
     """Select groups with small center offset (< max_offset_frac * R200c)."""
-    n_groups = len(groups['Group_M_Crit200'])
-    mask = np.zeros(n_groups, dtype=bool)
+    mask = pre_mask.copy()
 
     group_pos = groups['GroupPos']
     subhalo_pos = subhalos['SubhaloPos']
     R200c = groups['Group_R_Crit200']
     first_sub = groups['GroupFirstSub']
-    n_subs = groups['GroupNsubs']
 
+    candidates = np.where(pre_mask)[0]
     offset_fracs = []
-    for i in range(n_groups):
-        if n_subs[i] == 0 or R200c[i] <= 0:
+
+    for i in candidates:
+        if R200c[i] <= 0:
+            mask[i] = False
             continue
 
         central_idx = first_sub[i]
         offset = np.linalg.norm(group_pos[i] - subhalo_pos[central_idx])
         offset_frac = offset / R200c[i]
         offset_fracs.append(offset_frac)
-        mask[i] = offset_frac < max_offset_frac
+
+        if offset_frac >= max_offset_frac:
+            mask[i] = False
 
     offset_fracs = np.array(offset_fracs)
-    n_with_r200 = len(offset_fracs)
     print(f"  Offset cut (< {max_offset_frac}): "
-          f"{mask.sum()}/{n_with_r200} groups with R200c>0 pass")
-    if n_with_r200 > 0:
+          f"{mask.sum()}/{pre_mask.sum()} pass")
+    if len(offset_fracs) > 0:
         print(f"    Offset fraction: min={offset_fracs.min():.3f}, "
               f"median={np.median(offset_fracs):.3f}, "
               f"max={offset_fracs.max():.3f}")
+
+    # Debug: print example values for first few candidates
+    if len(candidates) > 0:
+        n_subhalos = len(subhalo_pos)
+        first_sub_vals = first_sub[candidates]
+        print(f"    Debug: n_subhalos={n_subhalos}, "
+              f"GroupFirstSub range=[{first_sub_vals.min()}, {first_sub_vals.max()}]")
+        print("    Debug - first 3 halos:")
+        for idx in candidates[:3]:
+            central_idx = first_sub[idx]
+            gpos = group_pos[idx]
+            spos = subhalo_pos[central_idx]
+            r200 = R200c[idx]
+            off = np.linalg.norm(gpos - spos)
+            print(f"      Halo {idx}: FirstSub={central_idx}, "
+                  f"R200c={r200:.2f}")
+            print(f"        GroupPos={gpos}")
+            print(f"        SubhaloPos={spos}")
+            print(f"        offset={off:.2f}, frac={off/r200:.4f}")
+
     return mask
 
 
-def apply_cosmological_origin_cut(groups, subhalos):
+def apply_cosmological_origin_cut(groups, subhalos, pre_mask):
     """Select groups whose central subhalo has SubhaloFlag == 1."""
-    n_groups = len(groups['Group_M_Crit200'])
-
     # SubhaloFlag only exists in full-physics runs. In DM-only runs,
     # all subhalos are cosmological by definition.
     if subhalos['SubhaloFlag'] is None:
         print("  Cosmological origin cut: skipped (DM-only run)")
-        return np.ones(n_groups, dtype=bool)
+        return pre_mask.copy()
 
-    mask = np.zeros(n_groups, dtype=bool)
+    mask = pre_mask.copy()
     subhalo_flag = subhalos['SubhaloFlag']
     first_sub = groups['GroupFirstSub']
-    n_subs = groups['GroupNsubs']
 
-    for i in range(n_groups):
-        if n_subs[i] == 0:
-            continue
+    for i in np.where(pre_mask)[0]:
         central_idx = first_sub[i]
-        mask[i] = subhalo_flag[central_idx] == 1
+        if subhalo_flag[central_idx] != 1:
+            mask[i] = False
 
-    print(f"  Cosmological origin cut: {mask.sum()}/{n_groups} groups pass")
+    print(f"  Cosmological origin cut: {mask.sum()}/{pre_mask.sum()} pass")
     return mask
 
 
-def apply_max_satellite_cut(groups, subhalos, max_satellite_ratio):
+def apply_max_satellite_cut(groups, subhalos, max_satellite_ratio, pre_mask):
     """Reject groups with a satellite subhalo more massive than threshold."""
-    n_groups = len(groups['Group_M_Crit200'])
-    mask = np.ones(n_groups, dtype=bool)
+    mask = pre_mask.copy()
 
     first_sub = groups['GroupFirstSub']
     n_subs = groups['GroupNsubs']
     subhalo_mass = subhalos['SubhaloMass']
 
-    for i in range(n_groups):
+    for i in np.where(pre_mask)[0]:
         if n_subs[i] <= 1:
             continue
 
@@ -211,20 +228,20 @@ def apply_max_satellite_cut(groups, subhalos, max_satellite_ratio):
                 break
 
     print(f"  Max satellite cut (M_sat < {max_satellite_ratio} M_central): "
-          f"{mask.sum()}/{n_groups} groups pass")
+          f"{mask.sum()}/{pre_mask.sum()} pass")
     return mask
 
 
 def apply_isolation_cut(groups, subhalos, isolation_distance,
-                        isolation_mass_ratio):
+                        isolation_mass_ratio, pre_mask):
     """
     Select isolated groups.
 
     Rejects halo i if there exists a neighbor (FoF group or Subfind subhalo)
     within (isolation_distance * R200c) where M > (isolation_mass_ratio * M_i).
     """
+    mask = pre_mask.copy()
     n_groups = len(groups['Group_M_Crit200'])
-    mask = np.ones(n_groups, dtype=bool)
 
     group_pos = groups['GroupPos']
     M200 = groups['Group_M_Crit200']
@@ -242,7 +259,7 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
         if n_subs[i] > 0:
             subhalo_group[first_sub[i]:first_sub[i] + n_subs[i]] = i
 
-    for i in range(n_groups):
+    for i in np.where(pre_mask)[0]:
         if R200c[i] <= 0 or M200[i] <= 0:
             mask[i] = False
             continue
@@ -278,7 +295,7 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
 
     print(f"  Isolation cut (d < {isolation_distance} R200c, "
           f"M_neighbor > {isolation_mass_ratio} M_self): "
-          f"{mask.sum()}/{n_groups} groups pass")
+          f"{mask.sum()}/{pre_mask.sum()} pass")
     return mask
 
 
@@ -292,12 +309,12 @@ def select_halos(groups, subhalos, min_mass, max_offset_frac,
     mask = groups['GroupNsubs'] > 0
     print(f"  Groups with subhalos: {mask.sum()}/{n_groups}")
 
-    mask &= apply_mass_cut(groups, min_mass)
-    mask &= apply_cosmological_origin_cut(groups, subhalos)
-    mask &= apply_offset_cut(groups, subhalos, max_offset_frac)
-    mask &= apply_max_satellite_cut(groups, subhalos, max_satellite_ratio)
-    mask &= apply_isolation_cut(
-        groups, subhalos, isolation_distance, isolation_mass_ratio)
+    mask = apply_mass_cut(groups, min_mass, mask)
+    mask = apply_cosmological_origin_cut(groups, subhalos, mask)
+    mask = apply_offset_cut(groups, subhalos, max_offset_frac, mask)
+    mask = apply_max_satellite_cut(groups, subhalos, max_satellite_ratio, mask)
+    mask = apply_isolation_cut(
+        groups, subhalos, isolation_distance, isolation_mass_ratio, mask)
 
     selected_indices = np.where(mask)[0]
     print(f"\nTotal selected: {len(selected_indices)} halos")
