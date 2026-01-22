@@ -90,7 +90,7 @@ def apply_mass_cut(groups, min_mass, pre_mask):
     return mask
 
 
-def apply_offset_cut(groups, subhalos, max_offset_frac, pre_mask):
+def apply_offset_cut(groups, subhalos, max_offset_frac, box_size, pre_mask):
     """Select groups with small center offset (< max_offset_frac * R200c).
 
     Offset is computed between SubhaloCM (center of mass) and SubhaloPos
@@ -112,7 +112,10 @@ def apply_offset_cut(groups, subhalos, max_offset_frac, pre_mask):
             continue
 
         central_idx = first_sub[i]
-        offset = np.linalg.norm(subhalo_cm[central_idx] - subhalo_pos[central_idx])
+        delta = subhalo_cm[central_idx] - subhalo_pos[central_idx]
+        # Apply periodic boundary conditions
+        delta = delta - box_size * np.round(delta / box_size)
+        offset = np.linalg.norm(delta)
         offset_frac = offset / R200c[i]
         offset_fracs.append(offset_frac)
 
@@ -189,9 +192,18 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
 
     Rejects halo i if there exists a neighbor (FoF group or Subfind subhalo)
     within (isolation_distance * R200c) where M > (isolation_mass_ratio * M_i).
+
+    Uses scipy KD-tree for efficient spatial queries.
     """
+    from scipy.spatial import cKDTree
+
     mask = pre_mask.copy()
     n_groups = len(groups['Group_M_Crit200'])
+    candidates = np.where(pre_mask)[0]
+
+    if len(candidates) == 0:
+        print(f"  Isolation cut: 0/0 pass (no candidates)")
+        return mask
 
     group_pos = groups['GroupPos']
     M200 = groups['Group_M_Crit200']
@@ -209,7 +221,34 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
         if n_subs[i] > 0:
             subhalo_group[first_sub[i]:first_sub[i] + n_subs[i]] = i
 
-    for i in np.where(pre_mask)[0]:
+    # Find the minimum mass threshold (for pre-filtering)
+    min_mass_threshold = isolation_mass_ratio * M200[candidates].min()
+
+    # Pre-filter groups by mass (only keep potentially problematic neighbors)
+    massive_groups_mask = M200 > min_mass_threshold
+    massive_group_indices = np.where(massive_groups_mask)[0]
+    print(f"    {len(massive_group_indices)} massive groups after pre-filtering")
+
+    # Build KD-tree for massive groups
+    if len(massive_group_indices) > 0:
+        group_tree = cKDTree(group_pos[massive_group_indices])
+    else:
+        group_tree = None
+
+    # Pre-filter subhalos by mass
+    massive_subhalo_mask = subhalo_mass > min_mass_threshold
+    massive_subhalo_indices = np.where(massive_subhalo_mask)[0]
+    print(f"    {len(massive_subhalo_indices)} massive subhalos after "
+          f"pre-filtering")
+
+    # Build KD-tree for massive subhalos
+    if len(massive_subhalo_indices) > 0:
+        subhalo_tree = cKDTree(subhalo_pos[massive_subhalo_indices])
+    else:
+        subhalo_tree = None
+
+    print(f"    Checking isolation for {len(candidates)} candidates...")
+    for i in candidates:
         if R200c[i] <= 0 or M200[i] <= 0:
             mask[i] = False
             continue
@@ -218,30 +257,30 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
         mass_threshold = isolation_mass_ratio * M200[i]
         center = group_pos[i]
 
-        # Check other FoF groups
-        for j in range(n_groups):
-            if j == i:
-                continue
-            if M200[j] <= mass_threshold:
-                continue
-            dist = np.linalg.norm(center - group_pos[j])
-            if dist < search_radius:
-                mask[i] = False
-                break
+        # Check massive FoF groups using KD-tree
+        if group_tree is not None:
+            nearby_idx = group_tree.query_ball_point(center, search_radius)
+            for local_j in nearby_idx:
+                j = massive_group_indices[local_j]
+                if j == i:
+                    continue
+                if M200[j] > mass_threshold:
+                    mask[i] = False
+                    break
 
         if not mask[i]:
             continue
 
-        # Check subhalos from other groups
-        for k in range(n_subhalos):
-            if subhalo_group[k] == i:
-                continue
-            if subhalo_mass[k] <= mass_threshold:
-                continue
-            dist = np.linalg.norm(center - subhalo_pos[k])
-            if dist < search_radius:
-                mask[i] = False
-                break
+        # Check massive subhalos using KD-tree
+        if subhalo_tree is not None:
+            nearby_idx = subhalo_tree.query_ball_point(center, search_radius)
+            for local_k in nearby_idx:
+                k = massive_subhalo_indices[local_k]
+                if subhalo_group[k] == i:
+                    continue
+                if subhalo_mass[k] > mass_threshold:
+                    mask[i] = False
+                    break
 
     print(f"  Isolation cut (d < {isolation_distance} R200c, "
           f"M_neighbor > {isolation_mass_ratio} M_self): "
@@ -249,7 +288,7 @@ def apply_isolation_cut(groups, subhalos, isolation_distance,
     return mask
 
 
-def select_halos(groups, subhalos, min_mass, max_offset_frac,
+def select_halos(groups, subhalos, box_size, min_mass, max_offset_frac,
                  isolation_distance, isolation_mass_ratio,
                  max_satellite_ratio):
     """Apply all selection criteria and return indices of selected groups."""
@@ -261,7 +300,7 @@ def select_halos(groups, subhalos, min_mass, max_offset_frac,
 
     mask = apply_mass_cut(groups, min_mass, mask)
     mask = apply_cosmological_origin_cut(groups, subhalos, mask)
-    mask = apply_offset_cut(groups, subhalos, max_offset_frac, mask)
+    mask = apply_offset_cut(groups, subhalos, max_offset_frac, box_size, mask)
     mask = apply_max_satellite_cut(groups, subhalos, max_satellite_ratio, mask)
     mask = apply_isolation_cut(
         groups, subhalos, isolation_distance, isolation_mass_ratio, mask)
@@ -530,6 +569,12 @@ def main():
         print(f"Isolation distance: {args.isolation_distance} x R200c")
         print(f"Isolation mass ratio: {args.isolation_mass_ratio}")
 
+        print("\nLoading snapshot header...")
+        header = load_snapshot_header(args.basepath, args.snap)
+        box_size = header['BoxSize']
+        print(f"  Box size: {box_size}")
+        print(f"  Redshift: {header['Redshift']}")
+
         print("\nLoading group catalog...")
         groups, subhalos = load_group_catalog(args.basepath, args.snap)
         print(f"  Loaded {len(groups['Group_M_Crit200'])} groups")
@@ -537,6 +582,7 @@ def main():
 
         selected = select_halos(
             groups, subhalos,
+            box_size=box_size,
             min_mass=args.min_mass,
             max_offset_frac=args.max_offset,
             isolation_distance=args.isolation_distance,
@@ -549,11 +595,13 @@ def main():
         groups = None
         subhalos = None
         selected = None
+        header = None
 
     # Broadcast data to all ranks
     groups = comm.bcast(groups, root=0)
     subhalos = comm.bcast(subhalos, root=0)
     selected = comm.bcast(selected, root=0)
+    header = comm.bcast(header, root=0)
 
     if not args.extract:
         return
@@ -567,17 +615,9 @@ def main():
 
     if rank == 0:
         print(f"\nOutput directory: {output_dir}")
-        print("\nLoading snapshot header...")
-        header = load_snapshot_header(args.basepath, args.snap)
-        print(f"  Box size: {header['BoxSize']}")
-        print(f"  Redshift: {header['Redshift']}")
         if args.subsample is not None:
             print(f"  Subsampling to {args.subsample} particles per halo "
                   f"(seed={args.seed})")
-    else:
-        header = None
-
-    header = comm.bcast(header, root=0)
 
     extract_halo_particles_mpi(
         args.basepath, args.snap, groups, subhalos,
