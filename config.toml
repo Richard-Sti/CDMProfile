@@ -5,6 +5,10 @@
 # Run name for equations (e.g., ext_maths)
 runname = "ext_maths"
 
+# Path to halo data (folder of .npy files or HDF5 file)
+# Can be overridden with --halos command line argument
+halos = "tng_particles/particles_099.hdf5"
+
 # Binning
 nbin = 100
 n_sample = 0  # Downsample halos to this many particles (0 = no downsampling)
@@ -50,7 +54,7 @@ failure_loss_percentile = 95
 # is worse than NFW's avg + factor (absolute threshold).
 # Multiple tiers: checked in order, earlier tiers catch clearly bad functions faster
 nfw_early_stop_enabled = true
-nfw_early_stop_halos = [50, 100]       # Check after this many halos
+nfw_early_stop_halos = [100, 200]       # Check after this many halos
 nfw_early_stop_factors = [2, 1]        # Stop if avg > NFW_avg + factor
 nfw_early_stop_same_halos = true  # Compare against NFW avg for same N halos (true) or all halos (false)
 
