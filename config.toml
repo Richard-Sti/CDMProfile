@@ -29,7 +29,7 @@ simpson_n = 512  # Number of intervals (must be even). Higher = more accurate bu
 
 # Multi-restart settings (lists indexed by number of free parameters: 1, 2, 3, ...)
 # Functions with more free params than list length use the last value
-max_restarts = [500, 1000, 2000]
+max_restarts = [500, 2000, 4000]
 nconv_required = [10, 10, 10]
 conv_rtol = 1e-3
 conv_atol = 10
@@ -40,6 +40,11 @@ early_stop_failures = 50
 # Minimum fraction of halos that must be successfully fit
 # Functions with fewer successful fits are discarded from ranking
 min_halo_success_fraction = 0.5
+
+# Percentile for imputing loss to failed halos (0-100)
+# Failed halos are assigned this percentile of the loss/npart distribution
+# from successful fits. Set to 0 to disable imputation.
+failure_loss_percentile = 95
 
 # NFW comparison early stopping: skip function if avg loss/npart after first N halos
 # is worse than NFW's avg + factor (absolute threshold).
@@ -54,8 +59,8 @@ nfw_early_stop_same_halos = true  # Compare against NFW avg for same N halos (tr
 Rs_lower_factor = 0.25      # Rs_min = rmin * Rs_lower_factor
 Rs_upper_factor = 10.0      # Rs_max = rmax * Rs_upper_factor
 # a0-a3 bounds (absolute)
-a_lower = -50.0
-a_upper = 50.0
+a_lower = -10.0
+a_upper = 10.0
 
 [asymptotes]
 # Post-fit asymptote validation for parameter-dependent functions
