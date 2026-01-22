@@ -25,7 +25,6 @@ Selection criteria:
 After selection, extracts DM particles within R200c (positions and radii).
 Supports MPI parallelization for particle extraction.
 """
-import glob
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -40,17 +39,8 @@ from mpi4py import MPI
 
 
 def load_group_catalog(basepath, snap_num):
-    """Load TNG group catalog from multiple chunk files."""
-    group_dir = Path(basepath) / f"groups_{snap_num:03d}"
-
-    chunk_files = sorted(glob.glob(str(group_dir / "fof_subhalo_tab_*.hdf5")))
-    if len(chunk_files) == 0:
-        single_file = group_dir / f"fof_subhalo_tab_{snap_num:03d}.hdf5"
-        if single_file.exists():
-            chunk_files = [str(single_file)]
-        else:
-            raise FileNotFoundError(
-                f"No group catalog files found in {group_dir}")
+    """Load TNG group catalog using illustris_python."""
+    import illustris_python as il
 
     group_fields = [
         'GroupPos',
@@ -67,65 +57,17 @@ def load_group_catalog(basepath, snap_num):
         'SubhaloLenType',
     ]
 
-    groups = {field: [] for field in group_fields}
-    subhalos = {field: [] for field in subhalo_fields}
-
-    # Track cumulative subhalo count for offsetting GroupFirstSub
-    subhalo_offset = 0
-
-    for fpath in chunk_files:
-        with h5py.File(fpath, 'r') as f:
-            n_subhalos_chunk = 0
-
-            if 'Subhalo' in f:
-                for field in subhalo_fields:
-                    if field in f['Subhalo']:
-                        data = f['Subhalo'][field][:]
-                        subhalos[field].append(data)
-                        if field == 'SubhaloPos':
-                            n_subhalos_chunk = len(data)
-
-            if 'Group' in f:
-                for field in group_fields:
-                    if field in f['Group']:
-                        data = f['Group'][field][:]
-                        # Offset GroupFirstSub to make it a global index
-                        if field == 'GroupFirstSub':
-                            # Only offset valid indices (>= 0)
-                            data = data.copy()
-                            valid = data >= 0
-                            data[valid] += subhalo_offset
-                        groups[field].append(data)
-
-            subhalo_offset += n_subhalos_chunk
-
-    for field in group_fields:
-        if len(groups[field]) > 0:
-            groups[field] = np.concatenate(groups[field], axis=0)
-        else:
-            groups[field] = None
-
-    for field in subhalo_fields:
-        if len(subhalos[field]) > 0:
-            subhalos[field] = np.concatenate(subhalos[field], axis=0)
-        else:
-            subhalos[field] = None
+    groups = il.groupcat.loadHalos(basepath, snap_num, fields=group_fields)
+    subhalos = il.groupcat.loadSubhalos(basepath, snap_num,
+                                        fields=subhalo_fields)
 
     return groups, subhalos
 
 
 def load_snapshot_header(basepath, snap_num):
     """Load snapshot header to get box size and other metadata."""
-    snap_dir = Path(basepath) / f"snapdir_{snap_num:03d}"
-    chunk_files = sorted(glob.glob(str(snap_dir / "snap_*.hdf5")))
-
-    if len(chunk_files) == 0:
-        raise FileNotFoundError(f"No snapshot files found in {snap_dir}")
-
-    with h5py.File(chunk_files[0], 'r') as f:
-        header = dict(f['Header'].attrs)
-
-    return header
+    import illustris_python as il
+    return il.groupcat.loadHeader(basepath, snap_num)
 
 
 ###############################################################################
@@ -175,29 +117,6 @@ def apply_offset_cut(groups, subhalos, max_offset_frac, pre_mask):
               f"median={np.median(offset_fracs):.3f}, "
               f"max={offset_fracs.max():.3f}")
 
-    # Debug: print example values for first few candidates
-    if len(candidates) > 0:
-        n_subhalos = len(subhalo_pos)
-        first_sub_vals = first_sub[candidates]
-        print(f"    Debug: n_subhalos={n_subhalos}, "
-              f"GroupFirstSub range=[{first_sub_vals.min()}, {first_sub_vals.max()}]")
-
-        # Find some halos that FAIL the cut
-        failed = [i for i in candidates if not mask[i]][:3]
-        if failed:
-            print("    Debug - first 3 FAILING halos:")
-            for idx in failed:
-                central_idx = first_sub[idx]
-                gpos = group_pos[idx]
-                spos = subhalo_pos[central_idx]
-                r200 = R200c[idx]
-                off = np.linalg.norm(gpos - spos)
-                print(f"      Halo {idx}: FirstSub={central_idx}, "
-                      f"R200c={r200:.2f}")
-                print(f"        GroupPos={gpos}")
-                print(f"        SubhaloPos={spos}")
-                print(f"        offset={off:.2f}, frac={off/r200:.4f}")
-
     return mask
 
 
@@ -205,7 +124,7 @@ def apply_cosmological_origin_cut(groups, subhalos, pre_mask):
     """Select groups whose central subhalo has SubhaloFlag == 1."""
     # SubhaloFlag only exists in full-physics runs. In DM-only runs,
     # all subhalos are cosmological by definition.
-    if subhalos['SubhaloFlag'] is None:
+    if 'SubhaloFlag' not in subhalos or subhalos['SubhaloFlag'] is None:
         print("  Cosmological origin cut: skipped (DM-only run)")
         return pre_mask.copy()
 
@@ -373,31 +292,32 @@ def print_selection_summary(groups, subhalos, selected_indices):
 ###############################################################################
 
 
-def load_dm_particles_for_halo(basepath, snap_num, center, radius, box_size):
-    """Load DM particles within radius of center, return 3D positions."""
-    snap_dir = Path(basepath) / f"snapdir_{snap_num:03d}"
-    chunk_files = sorted(glob.glob(str(snap_dir / "snap_*.hdf5")))
+def load_dm_particles_for_halo(basepath, snap_num, halo_id, center, radius,
+                               box_size):
+    """
+    Load DM particles within radius of center, return 3D positions.
 
-    all_pos = []
+    Uses FoF halo particles as the source, then filters to within radius.
+    This is an approximation - FoF membership != spherical R200c cut.
+    """
+    import illustris_python as il
 
-    for fpath in chunk_files:
-        with h5py.File(fpath, 'r') as f:
-            if 'PartType1' not in f:
-                continue
+    # Load all DM particles (PartType1) belonging to this FoF halo
+    coords = il.snapshot.loadHalo(basepath, snap_num, halo_id, 'dm',
+                                  fields=['Coordinates'])
 
-            coords = f['PartType1/Coordinates'][:]
-
-            delta = coords - center
-            delta = delta - box_size * np.round(delta / box_size)
-            dist = np.linalg.norm(delta, axis=1)
-
-            within = dist < radius
-            all_pos.append(delta[within])
-
-    if len(all_pos) == 0:
+    if coords is None or len(coords) == 0:
         return np.array([]).reshape(0, 3)
 
-    return np.concatenate(all_pos, axis=0)
+    # Compute positions relative to center with periodic boundary conditions
+    delta = coords - center
+    delta = delta - box_size * np.round(delta / box_size)
+
+    # Filter to particles within radius
+    dist = np.linalg.norm(delta, axis=1)
+    within = dist < radius
+
+    return delta[within]
 
 
 def balance_halos_by_mass(selected_indices, masses, size):
@@ -466,7 +386,7 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
         radius = R200c[group_idx]
 
         pos = load_dm_particles_for_halo(
-            basepath, snap_num, center, radius, box_size)
+            basepath, snap_num, group_idx, center, radius, box_size)
 
         if len(pos) == 0:
             print(f"  [Rank {rank}] Warning: No particles for halo "
