@@ -225,11 +225,26 @@ def print_asymptote_summary(n_param_dep, n_unknown, n_rejected, threshold_inf,
 
 
 def compute_function_scores(output_path, npart_per_halo,
-                            min_success_fraction=0.0):
+                            min_success_fraction=0.0,
+                            failure_loss_percentile=0):
     """
     Compute function scores from HDF5 results file.
 
-    Score = mean of (loss / npart) over successful fits only.
+    Score = mean of (loss / npart) over all halos. For halos where a function
+    failed, the loss is imputed using the specified percentile of successful
+    fits for that function.
+
+    Parameters
+    ----------
+    output_path : Path
+        Path to HDF5 results file.
+    npart_per_halo : array-like
+        Number of particles per halo.
+    min_success_fraction : float
+        Minimum fraction of halos that must be successfully fit.
+    failure_loss_percentile : float
+        Percentile (0-100) of successful fits to use for imputing failed halos.
+        If 0, no imputation is done and score is averaged over successful only.
 
     Returns
     -------
@@ -265,7 +280,31 @@ def compute_function_scores(output_path, npart_per_halo,
     unique_funcs, inverse_idx, counts = np.unique(
         func_idx, return_inverse=True, return_counts=True)
     sum_per_func = np.bincount(inverse_idx, weights=normalized_loss)
-    avg_scores = sum_per_func / counts
+
+    # Compute scores with optional imputation for failed halos
+    if failure_loss_percentile > 0:
+        # For each function, compute percentile of successful fits
+        # and use it to impute missing halos
+        avg_scores = np.zeros(len(unique_funcs))
+        for i, (fidx, n_success) in enumerate(zip(unique_funcs, counts)):
+            # Get normalized losses for this function
+            func_mask = func_idx == fidx
+            func_losses = normalized_loss[func_mask]
+
+            n_failed = n_halos_total - n_success
+            if n_failed > 0 and n_success > 0:
+                # Impute using percentile of successful fits
+                imputed_loss = np.percentile(
+                    func_losses, failure_loss_percentile)
+                total_loss = sum_per_func[i] + n_failed * imputed_loss
+                avg_scores[i] = total_loss / n_halos_total
+            else:
+                # No failed halos or no successful fits
+                avg_scores[i] = (
+                    sum_per_func[i] / n_success if n_success > 0 else np.inf)
+    else:
+        # Original behavior: average over successful fits only
+        avg_scores = sum_per_func / counts
 
     min_halos = int(min_success_fraction * n_halos_total)
     mask = counts >= min_halos
@@ -280,7 +319,7 @@ def compute_function_scores(output_path, npart_per_halo,
 
 def print_best_results(output_path, equations, npart_per_halo,
                        asymp_postfit_funcs=None, nfw_score=None, n_top=100,
-                       min_success_fraction=0.0):
+                       min_success_fraction=0.0, failure_loss_percentile=0):
     """Print a table of the best functions ranked by normalized loss."""
     output_path = Path(output_path)
     if not output_path.exists():
@@ -291,7 +330,8 @@ def print_best_results(output_path, equations, npart_per_halo,
         asymp_postfit_funcs = set()
 
     result = compute_function_scores(
-        output_path, npart_per_halo, min_success_fraction)
+        output_path, npart_per_halo, min_success_fraction,
+        failure_loss_percentile)
     scores, asymp_pass_dict, n_halos_total, n_filtered = result
 
     if nfw_score is not None:
@@ -334,6 +374,10 @@ def print_best_results(output_path, equations, npart_per_halo,
         min_halos = int(min_success_fraction * n_halos_total)
         print(f"(Filtered out {n_filtered} functions with < {min_halos} "
               f"successful fits)")
-    print("(AvgScore = mean of loss/npart over successful fits only)")
+    if failure_loss_percentile > 0:
+        print(f"(AvgScore = mean of loss/npart; failed halos imputed with "
+              f"p{failure_loss_percentile})")
+    else:
+        print("(AvgScore = mean of loss/npart over successful fits only)")
     print("(Asymp: inf%/zero% pass fractions for x->inf and x->0+ checks)")
     print("")
