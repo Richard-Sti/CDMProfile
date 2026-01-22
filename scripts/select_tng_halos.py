@@ -136,6 +136,7 @@ def apply_offset_cut(groups, subhalos, max_offset_frac):
     first_sub = groups['GroupFirstSub']
     n_subs = groups['GroupNsubs']
 
+    offset_fracs = []
     for i in range(n_groups):
         if n_subs[i] == 0 or R200c[i] <= 0:
             continue
@@ -143,10 +144,17 @@ def apply_offset_cut(groups, subhalos, max_offset_frac):
         central_idx = first_sub[i]
         offset = np.linalg.norm(group_pos[i] - subhalo_pos[central_idx])
         offset_frac = offset / R200c[i]
+        offset_fracs.append(offset_frac)
         mask[i] = offset_frac < max_offset_frac
 
+    offset_fracs = np.array(offset_fracs)
+    n_with_r200 = len(offset_fracs)
     print(f"  Offset cut (< {max_offset_frac}): "
-          f"{mask.sum()}/{n_groups} groups pass")
+          f"{mask.sum()}/{n_with_r200} groups with R200c>0 pass")
+    if n_with_r200 > 0:
+        print(f"    Offset fraction: min={offset_fracs.min():.3f}, "
+              f"median={np.median(offset_fracs):.3f}, "
+              f"max={offset_fracs.max():.3f}")
     return mask
 
 
