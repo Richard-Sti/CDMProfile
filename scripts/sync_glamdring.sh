@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---- local destination ----
+DEST_BASE="$HOME/Projects/CDMprofile"
+
+# ---- glamdring source ----
+SRC_USER="rstiskalek"
+SRC_HOST="glamdring.physics.ox.ac.uk"
+SSH_KEY="$HOME/.ssh/glamdring"
+
+# Source paths on glamdring
+SRC_RESULTS="/mnt/users/rstiskalek/CDMProfile/results"
+SRC_DATA="/mnt/extraspace/rstiskalek/CDMProfile/data"
+
+usage() {
+    echo "Usage: $0 [results|data]"
+    exit 1
+}
+
+# ---- parse argument ----
+if [[ $# -ne 1 ]]; then
+    usage
+fi
+
+echo "[INFO] Ensuring local destination exists: ${DEST_BASE}"
+mkdir -p "$DEST_BASE"
+
+case "$1" in
+    results)
+        echo "[INFO] Pulling 'results' from glamdring -> ${DEST_BASE}"
+        rsync -avh --progress -e "ssh -i $SSH_KEY" \
+          "$SRC_USER@$SRC_HOST:$SRC_RESULTS" \
+          "$DEST_BASE/"
+        ;;
+    data)
+        echo "[INFO] Pulling 'data' from glamdring -> ${DEST_BASE}"
+        rsync -avh --progress -e "ssh -i $SSH_KEY" \
+          "$SRC_USER@$SRC_HOST:$SRC_DATA" \
+          "$DEST_BASE/"
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+echo "[INFO] Sync complete."
