@@ -115,7 +115,8 @@ def clear_temp_dir(temp_dir):
 
 def write_ranking_to_file(output_path, equations, npart_per_halo,
                           nfw_score=None, txt_path=None,
-                          min_success_fraction=0.0):
+                          min_success_fraction=0.0,
+                          failure_loss_percentile=0):
     """Write ranking of best functions to a text file."""
     output_path = Path(output_path)
     if not output_path.exists():
@@ -128,11 +129,14 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
 
     scores, asymp_pass_dict, n_halos_total, n_filtered = \
         compute_function_scores(output_path, npart_per_halo,
-                                min_success_fraction)
+                                min_success_fraction, failure_loss_percentile)
 
     with open(txt_path, 'w') as f:
         f.write("# Best functions ranked by avg loss/npart per halo\n")
         f.write("# Lower score is better\n")
+        if failure_loss_percentile > 0:
+            f.write(f"# Failed halos imputed with p{failure_loss_percentile} "
+                    f"of successful fits\n")
         f.write(f"# Total functions: {len(scores)}\n")
         f.write(f"# Total halos: {n_halos_total}\n")
         if n_filtered > 0:
@@ -980,11 +984,23 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Fit density profiles with MPI")
     parser.add_argument("--complexity", type=int, required=True,
                         help="Equation complexity level")
-    parser.add_argument("--halos", type=str, required=True,
-                        help="Path to folder containing halo data")
+    parser.add_argument("--halos", type=str, default=None,
+                        help="Path to halo data (overrides config)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing results in temp directory")
     args = parser.parse_args()
+
+    # Resolve halos path: command line > config
+    if args.halos is not None:
+        halos_input = args.halos
+    else:
+        halos_input = fit_config.get('halos')
+        if halos_input is None:
+            raise ValueError("No halos path specified. Use --halos or set "
+                             "fitting.halos in config.toml")
+        # Resolve relative to data directory from local_config
+        data_dir = Path(config['path'].get('data', '.'))
+        halos_input = str(data_dir / halos_input)
 
     # Construct equations path from config
     runname = fit_config['runname']
@@ -999,8 +1015,12 @@ if __name__ == "__main__":
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    # Derive output filename from halos folder, runname, and complexity
-    halos_name = Path(args.halos).name
+    # Derive output filename from halos path, runname, and complexity
+    halos_path = Path(halos_input)
+    if halos_path.suffix in ['.hdf5', '.h5']:
+        halos_name = halos_path.stem  # Use filename without extension
+    else:
+        halos_name = halos_path.name  # Use folder name
     output_fname = f"fit_{runname}_compl{args.complexity}_{halos_name}.hdf5"
     output_path = results_base / output_fname
 
@@ -1120,7 +1140,10 @@ if __name__ == "__main__":
 
     # Load and bin halos on rank 0, then broadcast to all
     if rank == 0:
-        halos = cdmprof.load_from_folder(args.halos)
+        if halos_path.suffix in ['.hdf5', '.h5']:
+            halos = cdmprof.data.load_from_hdf5(halos_path)
+        else:
+            halos = cdmprof.load_from_folder(halos_path)
         n_sample = fit_config.get('n_sample', 0)
         binned = halos.bin(
             nbin=fit_config['nbin'],
@@ -1130,6 +1153,7 @@ if __name__ == "__main__":
         del halos
 
         print(f"Run: {runname}, complexity: {args.complexity}", flush=True)
+        print(f"Halos: {halos_path}", flush=True)
         n_skipped = len(skip_func_idx)
         n_completed = len(completed_func_idx)
         print(f"Functions: {len(job_queue)} to fit "
@@ -1344,9 +1368,11 @@ if __name__ == "__main__":
 
         t0 = time()
         min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
+        failure_percentile = fit_config.get('failure_loss_percentile', 0)
         print_best_results(output_path, equations, npart_per_halo,
                            nfw_score=nfw_score,
-                           min_success_fraction=min_success_frac)
+                           min_success_fraction=min_success_frac,
+                           failure_loss_percentile=failure_percentile)
         print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
 
         # Save results to text files if enabled
@@ -1354,7 +1380,8 @@ if __name__ == "__main__":
             t0 = time()
             write_ranking_to_file(output_path, equations, npart_per_halo,
                                   nfw_score=nfw_score,
-                                  min_success_fraction=min_success_frac)
+                                  min_success_fraction=min_success_frac,
+                                  failure_loss_percentile=failure_percentile)
             print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
                   flush=True)
             t0 = time()
@@ -1448,9 +1475,11 @@ if __name__ == "__main__":
 
             t0 = time()
             min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
+            failure_percentile = fit_config.get('failure_loss_percentile', 0)
             print_best_results(output_path, equations, npart_per_halo,
                                nfw_score=nfw_score,
-                               min_success_fraction=min_success_frac)
+                               min_success_fraction=min_success_frac,
+                               failure_loss_percentile=failure_percentile)
             print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
 
             # Save results to text files if enabled
@@ -1458,7 +1487,8 @@ if __name__ == "__main__":
                 t0 = time()
                 write_ranking_to_file(output_path, equations, npart_per_halo,
                                       nfw_score=nfw_score,
-                                      min_success_fraction=min_success_frac)
+                                      min_success_fraction=min_success_frac,
+                                      failure_loss_percentile=failure_percentile)
                 print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
                       flush=True)
                 t0 = time()

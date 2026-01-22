@@ -3,13 +3,13 @@
 # Submit fit_functions.py to glamdring queue.
 #
 # Usage:
-#   ./fit_functions.sh <on_login> <nprocs> <complexity> <halos> [--resume]
+#   ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--resume]
 #
 # Arguments:
 #   on_login   : 1 to run locally, 0 to submit to queue
 #   nprocs     : Number of MPI processes
 #   complexity : Equation complexity level
-#   halos      : Path to folder containing halo data
+#   --halos    : Optional path to halo data (overrides config.toml)
 #   --resume   : Optional flag to resume from existing results
 #
 
@@ -19,23 +19,43 @@ queue="berg"
 on_login=${1}
 nprocs=${2}
 complexity=${3}
-halos=${4}
-resume_flag=${5}
+shift 3
+
+# Parse optional arguments
+halos=""
+resume_flag=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --halos)
+            halos="$2"
+            shift 2
+            ;;
+        --resume)
+            resume_flag="--resume"
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
 
 # Check required arguments
-if [ -z "$on_login" ] || [ -z "$nprocs" ] || [ -z "$complexity" ] || [ -z "$halos" ]; then
-    echo "Usage: ./fit_functions.sh <on_login> <nprocs> <complexity> <halos> [--resume]"
+if [ -z "$on_login" ] || [ -z "$nprocs" ] || [ -z "$complexity" ]; then
+    echo "Usage: ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--resume]"
     echo ""
     echo "Arguments:"
     echo "  on_login    1 to run locally, 0 to submit to queue (required)"
     echo "  nprocs      Number of MPI processes (required)"
     echo "  complexity  Equation complexity level (required)"
-    echo "  halos       Path to folder containing halo data (required)"
+    echo "  --halos     Path to halo data (optional, uses config.toml if not specified)"
     echo "  --resume    Resume from existing results (optional)"
     echo ""
     echo "Example:"
-    echo "  ./fit_functions.sh 1 4 3 /path/to/halos"
-    echo "  ./fit_functions.sh 0 32 5 /path/to/halos --resume"
+    echo "  ./fit_functions.sh 1 4 3"
+    echo "  ./fit_functions.sh 1 4 3 --halos /path/to/halos.hdf5"
+    echo "  ./fit_functions.sh 0 32 5 --resume"
     exit 1
 fi
 
@@ -67,8 +87,11 @@ fi
 
 env="$venv/bin/python"
 
-pythoncm="$env $file --complexity $complexity --halos $halos"
-if [ "$resume_flag" == "--resume" ]; then
+pythoncm="$env $file --complexity $complexity"
+if [ -n "$halos" ]; then
+    pythoncm="$pythoncm --halos $halos"
+fi
+if [ -n "$resume_flag" ]; then
     pythoncm="$pythoncm --resume"
 fi
 
