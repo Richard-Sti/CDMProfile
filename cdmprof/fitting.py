@@ -388,8 +388,12 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
 
         Uses LHS for better coverage of parameter space. Stops early if
         optimizer converges to the same minimum `nconv_required` times.
-        Returns dict with loss, params, converged, confirmed, neval,
+        Returns dict with loss, loss_all, params, converged, confirmed, neval,
         nrestart_used, nconv, reject_reason.
+
+        The `loss_all` field contains the best loss from all attempts,
+        including those that failed (loss >= 1e29). This is useful for
+        computing statistics across all halos, even those that didn't converge.
         """
         if param_bounds is None:
             param_bounds = [(rmin * Rs_lower_factor, rmax * Rs_upper_factor)]
@@ -407,6 +411,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         lhs_samples = _generate_lhs_samples(param_bounds, max_restarts, seed)
 
         best_loss = np.inf
+        best_loss_all = np.inf  # Track best loss including failed attempts
         best_params = None
         best_converged = False
         total_neval = 0
@@ -431,6 +436,10 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
             # Skip if optimizer failed (loss is huge)
             if result['loss'] >= 1e29:
                 continue
+
+            # Track best loss from all attempts (only valid ones, loss < 1e29)
+            if result['loss'] < best_loss_all:
+                best_loss_all = result['loss']
 
             # Convergence tolerance: atol + rtol * |best_loss|
             tol = conv_atol + conv_rtol * abs(best_loss)
@@ -461,6 +470,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
 
         return {
             'loss': best_loss,
+            'loss_all': best_loss_all,  # Best loss including failed attempts
             'params': best_params,
             'converged': best_converged,
             'confirmed': nconv >= nconv_required,
