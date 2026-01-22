@@ -164,18 +164,22 @@ def apply_offset_cut(groups, subhalos, max_offset_frac, pre_mask):
         first_sub_vals = first_sub[candidates]
         print(f"    Debug: n_subhalos={n_subhalos}, "
               f"GroupFirstSub range=[{first_sub_vals.min()}, {first_sub_vals.max()}]")
-        print("    Debug - first 3 halos:")
-        for idx in candidates[:3]:
-            central_idx = first_sub[idx]
-            gpos = group_pos[idx]
-            spos = subhalo_pos[central_idx]
-            r200 = R200c[idx]
-            off = np.linalg.norm(gpos - spos)
-            print(f"      Halo {idx}: FirstSub={central_idx}, "
-                  f"R200c={r200:.2f}")
-            print(f"        GroupPos={gpos}")
-            print(f"        SubhaloPos={spos}")
-            print(f"        offset={off:.2f}, frac={off/r200:.4f}")
+
+        # Find some halos that FAIL the cut
+        failed = [i for i in candidates if not mask[i]][:3]
+        if failed:
+            print("    Debug - first 3 FAILING halos:")
+            for idx in failed:
+                central_idx = first_sub[idx]
+                gpos = group_pos[idx]
+                spos = subhalo_pos[central_idx]
+                r200 = R200c[idx]
+                off = np.linalg.norm(gpos - spos)
+                print(f"      Halo {idx}: FirstSub={central_idx}, "
+                      f"R200c={r200:.2f}")
+                print(f"        GroupPos={gpos}")
+                print(f"        SubhaloPos={spos}")
+                print(f"        offset={off:.2f}, frac={off/r200:.4f}")
 
     return mask
 
