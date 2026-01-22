@@ -554,7 +554,21 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
             f.attrs["units_positions"] = "ckpc/h (relative to halo center)"
             f.attrs["units_radii"] = "ckpc/h (distance from halo center)"
 
-        print(f"\nSaved particle data to {output_file}")
+        # Get file size
+        file_size = output_file.stat().st_size
+        if file_size > 1e9:
+            size_str = f"{file_size / 1e9:.2f} GB"
+        else:
+            size_str = f"{file_size / 1e6:.1f} MB"
+
+        print("\n" + "=" * 70)
+        print("OUTPUT FILE")
+        print("=" * 70)
+        print(f"  Path:       {output_file}")
+        print(f"  Size:       {size_str}")
+        print(f"  N halos:    {len(halo_ids)}")
+        print(f"  N particles: {len(all_pos):,}")
+        print("=" * 70)
 
 
 ###############################################################################
