@@ -402,6 +402,65 @@ def load_dm_particles_for_halo(basepath, snap_num, halo_id, center, radius,
     return delta[within]
 
 
+def check_decreasing_outer_profile(pos, r200c, r_min_frac=0.6, r_max_frac=1.0,
+                                    n_bins=10):
+    """
+    Check if particle density decreases on average in outer radial bins.
+
+    Fits a line to log(density) vs log(r) and checks if slope is negative.
+    This is robust to Poisson noise in individual bins.
+
+    Parameters
+    ----------
+    pos : ndarray
+        Particle positions relative to halo center (N, 3).
+    r200c : float
+        R200c of the halo.
+    r_min_frac : float
+        Inner edge of check region as fraction of R200c.
+    r_max_frac : float
+        Outer edge of check region as fraction of R200c.
+    n_bins : int
+        Number of bins for fitting.
+
+    Returns
+    -------
+    bool
+        True if density is decreasing on average, False otherwise.
+    """
+    radii = np.linalg.norm(pos, axis=1)
+    r_norm = radii / r200c
+
+    # Select particles in the outer region
+    mask = (r_norm >= r_min_frac) & (r_norm <= r_max_frac)
+    if mask.sum() < 2 * n_bins:
+        return True  # Not enough particles to check
+
+    r_outer = r_norm[mask]
+    bin_edges = np.linspace(r_min_frac, r_max_frac, n_bins + 1)
+    counts, _ = np.histogram(r_outer, bins=bin_edges)
+
+    # Compute density (counts / shell volume, proportional to r^2 * dr)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    shell_volumes = bin_edges[1:]**3 - bin_edges[:-1]**3  # proportional to volume
+    density = counts / shell_volumes
+
+    # Only fit bins with non-zero counts
+    valid = density > 0
+    if valid.sum() < 3:
+        return True  # Not enough valid bins
+
+    # Fit line to log(density) vs log(r)
+    log_r = np.log(bin_centers[valid])
+    log_rho = np.log(density[valid])
+
+    # Simple linear regression: slope = cov(x,y) / var(x)
+    slope = np.cov(log_r, log_rho)[0, 1] / np.var(log_r)
+
+    # Density should decrease (negative slope)
+    return slope < 0
+
+
 def balance_halos_by_mass(selected_indices, masses, size):
     """Distribute halos among ranks so total mass per rank is balanced."""
     # Sort by mass descending (assign largest first)
@@ -459,6 +518,7 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
     my_halo_ids = []
     my_positions = []
     my_npart = []
+    my_rejected_monotonic = 0
     n_my_halos = len(my_indices)
     report_every = max(1, n_my_halos // 10)
 
@@ -474,6 +534,12 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
             print(f"  [Rank {rank}] Warning: No particles for halo "
                   f"{group_idx}")
             continue
+
+        # Check decreasing outer profile if requested
+        if args.check_monotonic:
+            if not check_decreasing_outer_profile(pos, radius):
+                my_rejected_monotonic += 1
+                continue
 
         # Subsample if requested
         if args.subsample is not None and len(pos) > args.subsample:
@@ -491,8 +557,15 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
     all_halo_ids = comm.gather(my_halo_ids, root=0)
     all_positions = comm.gather(my_positions, root=0)
     all_npart = comm.gather(my_npart, root=0)
+    all_rejected_monotonic = comm.gather(my_rejected_monotonic, root=0)
 
     if rank == 0:
+        # Report monotonic rejections
+        total_rejected_monotonic = sum(all_rejected_monotonic)
+        if args.check_monotonic and total_rejected_monotonic > 0:
+            print(f"  Rejected {total_rejected_monotonic} halos with "
+                  f"non-monotonic outer profile")
+
         # Flatten lists from all ranks
         halo_ids = []
         positions = []
@@ -601,6 +674,8 @@ def main():
                         help="Subsample to fixed number of particles per halo")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for subsampling (default: 42)")
+    parser.add_argument("--check-monotonic", action="store_true",
+                        help="Reject halos with non-monotonic outer profile")
     args = parser.parse_args()
 
     # Only rank 0 prints header and does selection
