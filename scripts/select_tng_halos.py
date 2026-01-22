@@ -18,7 +18,7 @@ Script to select TNG halos for density profile fitting.
 Selection criteria:
     1. Minimum mass (Group_M_Crit200 > threshold)
     2. Centrals only (use central subhalo particles)
-    3. Center offset (|GroupPos - SubhaloPos| / R200c < threshold)
+    3. Center offset (|SubhaloCM - SubhaloPos| / R200c < threshold)
     4. Cosmological origin (SubhaloFlag == 1)
     5. Isolation (no massive neighbor within some radius)
 
@@ -29,6 +29,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import h5py
+import illustris_python as il
 import numpy as np
 from mpi4py import MPI
 
@@ -40,8 +41,6 @@ from mpi4py import MPI
 
 def load_group_catalog(basepath, snap_num):
     """Load TNG group catalog using illustris_python."""
-    import illustris_python as il
-
     group_fields = [
         'GroupPos',
         'Group_M_Crit200',
@@ -52,6 +51,7 @@ def load_group_catalog(basepath, snap_num):
     ]
     subhalo_fields = [
         'SubhaloPos',
+        'SubhaloCM',
         'SubhaloMass',
         'SubhaloLenType',
     ]
@@ -73,7 +73,6 @@ def load_group_catalog(basepath, snap_num):
 
 def load_snapshot_header(basepath, snap_num):
     """Load snapshot header to get box size and other metadata."""
-    import illustris_python as il
     return il.groupcat.loadHeader(basepath, snap_num)
 
 
@@ -92,11 +91,15 @@ def apply_mass_cut(groups, min_mass, pre_mask):
 
 
 def apply_offset_cut(groups, subhalos, max_offset_frac, pre_mask):
-    """Select groups with small center offset (< max_offset_frac * R200c)."""
+    """Select groups with small center offset (< max_offset_frac * R200c).
+
+    Offset is computed between SubhaloCM (center of mass) and SubhaloPos
+    (most bound particle position) of the central subhalo.
+    """
     mask = pre_mask.copy()
 
-    group_pos = groups['GroupPos']
     subhalo_pos = subhalos['SubhaloPos']
+    subhalo_cm = subhalos['SubhaloCM']
     R200c = groups['Group_R_Crit200']
     first_sub = groups['GroupFirstSub']
 
@@ -109,7 +112,7 @@ def apply_offset_cut(groups, subhalos, max_offset_frac, pre_mask):
             continue
 
         central_idx = first_sub[i]
-        offset = np.linalg.norm(group_pos[i] - subhalo_pos[central_idx])
+        offset = np.linalg.norm(subhalo_cm[central_idx] - subhalo_pos[central_idx])
         offset_frac = offset / R200c[i]
         offset_fracs.append(offset_frac)
 
@@ -307,8 +310,6 @@ def load_dm_particles_for_halo(basepath, snap_num, halo_id, center, radius,
     Uses FoF halo particles as the source, then filters to within radius.
     This is an approximation - FoF membership != spherical R200c cut.
     """
-    import illustris_python as il
-
     # Load all DM particles (PartType1) belonging to this FoF halo
     coords = il.snapshot.loadHalo(basepath, snap_num, halo_id, 'dm',
                                   fields=['Coordinates'])
