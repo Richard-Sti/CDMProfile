@@ -232,7 +232,7 @@ def load_from_hdf5(filepath):
     Parameters
     ----------
     filepath : str or Path
-        Path to HDF5 file with radii/halo_id/offset structure.
+        Path to HDF5 file with radii/halo_id/offsets structure.
 
     Returns
     -------
@@ -241,7 +241,11 @@ def load_from_hdf5(filepath):
     with File(filepath, 'r') as f:
         radii = f['radii'][:]
         halo_ids = f['halo_id'][:]
-        offset = f['offset'][:]
+        # Support both 'offset' and 'offsets' key names
+        if 'offsets' in f:
+            offset = f['offsets'][:]
+        else:
+            offset = f['offset'][:]
     return HaloData(radii, halo_ids, offset)
 
 
