@@ -99,7 +99,7 @@ def _limit_worker(queue, eq, limit_type):
         queue.put("unknown")
 
 
-def _compute_asymptote(idx, eq, verbose=False, rank=0, timeout=15):
+def _compute_asymptote(idx, eq, verbose=False, rank=0, timeout=5):
     """
     Compute limits as x -> 0+ and x -> infinity for an equation.
 
@@ -114,7 +114,7 @@ def _compute_asymptote(idx, eq, verbose=False, rank=0, timeout=15):
     rank : int, optional
         MPI rank (for verbose output).
     timeout : int, optional
-        Timeout in seconds for each limit computation. Default: 15.
+        Timeout in seconds for each limit computation. Default: 5.
 
     Returns
     -------
@@ -141,7 +141,8 @@ def _compute_asymptote(idx, eq, verbose=False, rank=0, timeout=15):
         proc.join()
         lim_zero_str = "timeout"
         if verbose:
-            print(f"  [Rank {rank}] idx={idx} TIMEOUT on lim(x->0+)", flush=True)
+            print(f"  [Rank {rank}] idx={idx} TIMEOUT on lim(x->0+): {eq}",
+                  flush=True)
     else:
         try:
             lim_zero_str = queue.get_nowait()
@@ -161,7 +162,8 @@ def _compute_asymptote(idx, eq, verbose=False, rank=0, timeout=15):
         proc.join()
         lim_inf_str = "timeout"
         if verbose:
-            print(f"  [Rank {rank}] idx={idx} TIMEOUT on lim(x->inf)", flush=True)
+            print(f"  [Rank {rank}] idx={idx} TIMEOUT on lim(x->inf): {eq}",
+                  flush=True)
     else:
         try:
             lim_inf_str = queue.get_nowait()
@@ -172,7 +174,7 @@ def _compute_asymptote(idx, eq, verbose=False, rank=0, timeout=15):
 
 
 def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False,
-                       timeout=15):
+                       timeout=5):
     """
     Compute asymptotic behavior for all equations (MPI parallelized).
 
@@ -193,7 +195,7 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False,
     verbose : bool, optional
         If True, print each limit computation (helps debug stuck limits).
     timeout : int, optional
-        Timeout in seconds for each limit computation. Default: 15.
+        Timeout in seconds for each limit computation. Default: 5.
 
     Returns
     -------
@@ -566,9 +568,9 @@ if __name__ == "__main__":
     parser.add_argument("--runname", type=str,
                         help="ESR run name, defining the basis functions.")
     parser.add_argument("--comp", type=int, help="Function complexity.")
-    parser.add_argument("--asymp-timeout", type=int, default=15,
+    parser.add_argument("--asymp-timeout", type=int, default=5,
                         help="Timeout (seconds) for each asymptote limit "
-                             "computation. Default: 15.")
+                             "computation. Default: 5.")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
