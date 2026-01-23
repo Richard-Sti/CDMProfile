@@ -3,18 +3,18 @@
 # Submit fit_functions.py to glamdring queue.
 #
 # Usage:
-#   ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--resume]
+#   ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--queue <name>] [--resume]
 #
 # Arguments:
 #   on_login   : 1 to run locally, 0 to submit to queue
 #   nprocs     : Number of MPI processes
 #   complexity : Equation complexity level
 #   --halos    : Optional path to halo data (overrides config.toml)
+#   --queue    : Optional queue/node name (default: berg)
 #   --resume   : Optional flag to resume from existing results
 #
 
 memory=3
-queue="berg"
 
 on_login=${1}
 nprocs=${2}
@@ -23,11 +23,16 @@ shift 3
 
 # Parse optional arguments
 halos=""
+queue="berg"
 resume_flag=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --halos)
             halos="$2"
+            shift 2
+            ;;
+        --queue)
+            queue="$2"
             shift 2
             ;;
         --resume)
@@ -43,18 +48,19 @@ done
 
 # Check required arguments
 if [ -z "$on_login" ] || [ -z "$nprocs" ] || [ -z "$complexity" ]; then
-    echo "Usage: ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--resume]"
+    echo "Usage: ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--queue <name>] [--resume]"
     echo ""
     echo "Arguments:"
     echo "  on_login    1 to run locally, 0 to submit to queue (required)"
     echo "  nprocs      Number of MPI processes (required)"
     echo "  complexity  Equation complexity level (required)"
     echo "  --halos     Path to halo data (optional, uses config.toml if not specified)"
+    echo "  --queue     Queue/node name (optional, default: berg)"
     echo "  --resume    Resume from existing results (optional)"
     echo ""
     echo "Example:"
     echo "  ./fit_functions.sh 1 4 3"
-    echo "  ./fit_functions.sh 1 4 3 --halos /path/to/halos.hdf5"
+    echo "  ./fit_functions.sh 0 32 5 --queue jaffe"
     echo "  ./fit_functions.sh 0 32 5 --resume"
     exit 1
 fi
