@@ -234,6 +234,8 @@ def compute_function_scores(output_path, npart_per_halo,
     failed, the loss is imputed using the specified percentile of successful
     fits for that function.
 
+    Also computes BIC = nparams * ln(npart) + 2 * loss for model comparison.
+
     Parameters
     ----------
     output_path : Path
@@ -249,7 +251,7 @@ def compute_function_scores(output_path, npart_per_halo,
     Returns
     -------
     scores : list of tuples
-        (func_idx, avg_score, n_halos) sorted by score ascending.
+        (func_idx, avg_score, avg_bic, nparams, n_halos) sorted by score.
     asymp_pass_dict : dict
         func_idx -> (n_pass_inf, n_pass_zero, n_total).
     n_halos_total : int
@@ -263,6 +265,7 @@ def compute_function_scores(output_path, npart_per_halo,
         func_idx = f['func_idx'][:]
         halo_idx = f['halo_idx'][:]
         loss = f['loss'][:]
+        params = f['params'][:]
 
         if 'asymp_pass_func_idx' in f:
             apf_idx = f['asymp_pass_func_idx'][:]
@@ -277,49 +280,75 @@ def compute_function_scores(output_path, npart_per_halo,
     n_halos_total = len(npart_per_halo)
     normalized_loss = loss / npart_per_halo[halo_idx]
 
+    # Compute nparams per result (count non-NaN params)
+    nparams_per_result = np.sum(~np.isnan(params), axis=1)
+
+    # Compute BIC per result: BIC = k * ln(n) + 2 * loss
+    npart_per_result = npart_per_halo[halo_idx]
+    bic_per_result = (nparams_per_result * np.log(npart_per_result)
+                      + 2 * loss)
+
     unique_funcs, inverse_idx, counts = np.unique(
         func_idx, return_inverse=True, return_counts=True)
     sum_per_func = np.bincount(inverse_idx, weights=normalized_loss)
+    sum_bic_per_func = np.bincount(inverse_idx, weights=bic_per_result)
+
+    # Get nparams per function (same for all halos of a function)
+    nparams_per_func = np.zeros(len(unique_funcs), dtype=int)
+    for i, fidx in enumerate(unique_funcs):
+        mask = func_idx == fidx
+        nparams_per_func[i] = nparams_per_result[mask][0]
 
     # Compute scores with optional imputation for failed halos
     if failure_loss_percentile > 0:
         # For each function, compute percentile of successful fits
         # and use it to impute missing halos
         avg_scores = np.zeros(len(unique_funcs))
+        avg_bic = np.zeros(len(unique_funcs))
         for i, (fidx, n_success) in enumerate(zip(unique_funcs, counts)):
             # Get normalized losses for this function
             func_mask = func_idx == fidx
             func_losses = normalized_loss[func_mask]
+            func_bics = bic_per_result[func_mask]
 
             n_failed = n_halos_total - n_success
             if n_failed > 0 and n_success > 0:
                 # Impute using percentile of successful fits
                 imputed_loss = np.percentile(
                     func_losses, failure_loss_percentile)
+                imputed_bic = np.percentile(
+                    func_bics, failure_loss_percentile)
                 total_loss = sum_per_func[i] + n_failed * imputed_loss
+                total_bic = sum_bic_per_func[i] + n_failed * imputed_bic
                 avg_scores[i] = total_loss / n_halos_total
+                avg_bic[i] = total_bic / n_halos_total
             else:
                 # No failed halos or no successful fits
                 avg_scores[i] = (
                     sum_per_func[i] / n_success if n_success > 0 else np.inf)
+                avg_bic[i] = (
+                    sum_bic_per_func[i] / n_success if n_success > 0 else np.inf)
     else:
         # Original behavior: average over successful fits only
         avg_scores = sum_per_func / counts
+        avg_bic = sum_bic_per_func / counts
 
     min_halos = int(min_success_fraction * n_halos_total)
     mask = counts >= min_halos
     n_filtered = np.sum(~mask)
 
-    scores = [(f, s, c) for f, s, c, m
-              in zip(unique_funcs, avg_scores, counts, mask) if m]
+    scores = [(f, s, b, k, c) for f, s, b, k, c, m
+              in zip(unique_funcs, avg_scores, avg_bic, nparams_per_func,
+                     counts, mask) if m]
     scores.sort(key=lambda x: x[1])
 
     return scores, asymp_pass_dict, n_halos_total, n_filtered
 
 
 def print_best_results(output_path, equations, npart_per_halo,
-                       asymp_postfit_funcs=None, nfw_score=None, n_top=100,
-                       min_success_fraction=0.0, failure_loss_percentile=0):
+                       asymp_postfit_funcs=None, nfw_score=None, nfw_bic=None,
+                       n_top=100, min_success_fraction=0.0,
+                       failure_loss_percentile=0):
     """Print a table of the best functions ranked by normalized loss."""
     output_path = Path(output_path)
     if not output_path.exists():
@@ -335,23 +364,26 @@ def print_best_results(output_path, equations, npart_per_halo,
     scores, asymp_pass_dict, n_halos_total, n_filtered = result
 
     if nfw_score is not None:
-        print("\n" + "-" * 79)
-        print(f"NFW REFERENCE: AvgScore = {nfw_score:.4f}  "
-              f"(rho = 1 / (x * (1 + x)^2))")
-        print("-" * 79)
+        print("\n" + "-" * 89)
+        nfw_str = f"NFW REFERENCE: AvgScore = {nfw_score:.4f}"
+        if nfw_bic is not None:
+            nfw_str += f", AvgBIC = {nfw_bic:.4f}"
+        nfw_str += "  (rho = 1 / (x * (1 + x)^2))"
+        print(nfw_str)
+        print("-" * 89)
 
-    print("\n" + "=" * 79)
+    print("\n" + "=" * 89)
     print("TOP FUNCTIONS (ranked by avg loss/npart per halo, lower is better)")
-    print("=" * 79)
-    header = f"{'Rank':<6} {'Func#':<8} {'AvgScore':<12} {'#Halos':<8} "
-    header += f"{'Asymp':<8} Equation"
+    print("=" * 89)
+    header = f"{'Rank':<6} {'Func#':<7} {'AvgScore':<10} {'AvgBIC':<10} "
+    header += f"{'k':<3} {'#Halo':<6} {'Asymp':<7} Equation"
     print(header)
-    print("-" * 79)
+    print("-" * 89)
 
-    for rank, (fidx, score, n_halos) in enumerate(scores[:n_top], 1):
+    for rank, (fidx, score, bic, nparams, n_halos) in enumerate(scores[:n_top], 1):
         eq = equations[fidx]
-        if len(eq) > 35:
-            eq = eq[:32] + "..."
+        if len(eq) > 30:
+            eq = eq[:27] + "..."
         if fidx in asymp_pass_dict:
             n_inf, n_zero, n_total = asymp_pass_dict[fidx]
             if n_total > 0:
@@ -364,11 +396,11 @@ def print_best_results(output_path, equations, npart_per_halo,
             asymp_status = "?"
         else:
             asymp_status = "-"
-        row = f"{rank:<6} {fidx:<8} {score:<12.4f} {n_halos:<8} "
-        row += f"{asymp_status:<8} {eq}"
+        row = f"{rank:<6} {fidx:<7} {score:<10.4f} {bic:<10.4f} "
+        row += f"{nparams:<3} {n_halos:<6} {asymp_status:<7} {eq}"
         print(row)
 
-    print("=" * 79)
+    print("=" * 89)
     print(f"Showing top {min(n_top, len(scores))} of {len(scores)} functions")
     if n_filtered > 0:
         min_halos = int(min_success_fraction * n_halos_total)
@@ -379,5 +411,6 @@ def print_best_results(output_path, equations, npart_per_halo,
               f"p{failure_loss_percentile})")
     else:
         print("(AvgScore = mean of loss/npart over successful fits only)")
+    print("(BIC = k*ln(n) + 2*loss; k = number of params)")
     print("(Asymp: inf%/zero% pass fractions for x->inf and x->0+ checks)")
     print("")

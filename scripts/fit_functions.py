@@ -124,7 +124,7 @@ def clear_temp_dir(temp_dir):
 
 
 def write_ranking_to_file(output_path, equations, npart_per_halo,
-                          nfw_score=None, txt_path=None,
+                          nfw_score=None, nfw_bic=None, txt_path=None,
                           min_success_fraction=0.0,
                           failure_loss_percentile=0):
     """Write ranking of best functions to a text file."""
@@ -144,6 +144,7 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
     with open(txt_path, 'w') as f:
         f.write("# Best functions ranked by avg loss/npart per halo\n")
         f.write("# Lower score is better\n")
+        f.write("# BIC = k*ln(n) + 2*loss (k = number of params)\n")
         if failure_loss_percentile > 0:
             f.write(f"# Failed halos imputed with p{failure_loss_percentile} "
                     f"of successful fits\n")
@@ -154,13 +155,16 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
             f.write(f"# Filtered out: {n_filtered} functions "
                     f"(< {min_halos} successful fits)\n")
         if nfw_score is not None:
-            f.write(f"# NFW reference score: {nfw_score:.6f}\n")
+            nfw_str = f"# NFW reference: score={nfw_score:.6f}"
+            if nfw_bic is not None:
+                nfw_str += f", BIC={nfw_bic:.6f}"
+            f.write(nfw_str + "\n")
         f.write("#\n")
-        f.write("# Columns: rank, func_idx, avg_score, n_halos, "
-                "asymp_inf%, asymp_zero%, equation\n")
+        f.write("# Columns: rank, func_idx, avg_score, avg_bic, nparams, "
+                "n_halos, asymp_inf%, asymp_zero%, equation\n")
         f.write("#\n")
 
-        for rank, (fidx, score, n_halos) in enumerate(scores, 1):
+        for rank, (fidx, score, bic, nparams, n_halos) in enumerate(scores, 1):
             eq = equations[fidx]
             if fidx in asymp_pass_dict:
                 n_inf, n_zero, n_total = asymp_pass_dict[fidx]
@@ -172,8 +176,8 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
             else:
                 pct_inf, pct_zero = -1, -1
 
-            f.write(f"{rank}\t{fidx}\t{score:.6f}\t{n_halos}\t"
-                    f"{pct_inf:.0f}\t{pct_zero:.0f}\t{eq}\n")
+            f.write(f"{rank}\t{fidx}\t{score:.6f}\t{bic:.6f}\t{nparams}\t"
+                    f"{n_halos}\t{pct_inf:.0f}\t{pct_zero:.0f}\t{eq}\n")
 
     print(f"Ranking saved to: {txt_path}")
 
@@ -240,9 +244,11 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
 
     Returns
     -------
-    float or None
-        NFW score (sum of loss/npart), or None if fitting fails.
-    np.ndarray or None (only if return_per_halo=True)
+    avg_score : float or None
+        NFW score (avg of loss/npart), or None if fitting fails.
+    avg_bic : float or None
+        NFW BIC score (avg of BIC/npart), or None if fitting fails.
+    per_halo_scores : np.ndarray or None (only if return_per_halo=True)
         Per-halo loss/npart values (nan for failed fits).
     """
     nfw_expr = "1 / (x * (1 + x)**2)"
@@ -252,13 +258,15 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
     except Exception as e:
         print(f"Failed to compile NFW profile: {e}", flush=True)
         if return_per_halo:
-            return None, None
-        return None
+            return None, None, None
+        return None, None
 
     nhalo = len(binned['halo_ids'])
     total_score = 0.0
+    total_bic = 0.0
     n_success = 0
     per_halo_scores = np.full(nhalo, np.nan)
+    nparams = fitter.nparams  # NFW has 1 param (Rs)
 
     for halo_idx in range(nhalo):
         try:
@@ -286,7 +294,11 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
             if result['params'] is not None:
                 npart = np.sum(binned['bin_counts'][halo_idx])
                 norm_loss = result['loss'] / npart
+                # BIC = k * ln(n) + 2 * loss
+                bic = nparams * np.log(npart) + 2 * result['loss']
+                norm_bic = bic / npart
                 total_score += norm_loss
+                total_bic += norm_bic
                 per_halo_scores[halo_idx] = norm_loss
                 n_success += 1
         except Exception:
@@ -294,20 +306,23 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
 
     if n_success == 0:
         if return_per_halo:
-            return None, None
-        return None
+            return None, None, None
+        return None, None
 
     # Penalize for missing halos
     if n_success < nhalo:
         mean_score = total_score / n_success
+        mean_bic = total_bic / n_success
         total_score += (nhalo - n_success) * mean_score
+        total_bic += (nhalo - n_success) * mean_bic
 
     # Convert to per-halo average
     avg_score = total_score / nhalo
+    avg_bic = total_bic / nhalo
 
     if return_per_halo:
-        return avg_score, per_halo_scores
-    return avg_score
+        return avg_score, avg_bic, per_halo_scores
+    return avg_score, avg_bic
 
 
 def setup_nfw_early_stop(fit_config, nfw_per_halo=None):
@@ -1210,7 +1225,7 @@ if __name__ == "__main__":
                   flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
-                nfw_score, nfw_per_halo = compute_nfw_scores(
+                nfw_score, nfw_bic, nfw_per_halo = compute_nfw_scores(
                     binned, fit_config, return_per_halo=True)
             if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
@@ -1373,14 +1388,14 @@ if __name__ == "__main__":
             print("Computing NFW reference score...", flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
-                nfw_score = compute_nfw_scores(binned, fit_config)
+                nfw_score, nfw_bic = compute_nfw_scores(binned, fit_config)
             print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s", flush=True)
 
         t0 = time()
         min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
         failure_percentile = fit_config.get('failure_loss_percentile', 0)
         print_best_results(output_path, equations, npart_per_halo,
-                           nfw_score=nfw_score,
+                           nfw_score=nfw_score, nfw_bic=nfw_bic,
                            min_success_fraction=min_success_frac,
                            failure_loss_percentile=failure_percentile)
         print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
@@ -1389,7 +1404,7 @@ if __name__ == "__main__":
         if fit_config.get('save_text_results', True):
             t0 = time()
             write_ranking_to_file(output_path, equations, npart_per_halo,
-                                  nfw_score=nfw_score,
+                                  nfw_score=nfw_score, nfw_bic=nfw_bic,
                                   min_success_fraction=min_success_frac,
                                   failure_loss_percentile=failure_percentile)
             print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
@@ -1419,7 +1434,7 @@ if __name__ == "__main__":
                   flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
-                nfw_score, nfw_per_halo = compute_nfw_scores(
+                nfw_score, nfw_bic, nfw_per_halo = compute_nfw_scores(
                     binned, fit_config, return_per_halo=True)
             if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
@@ -1479,7 +1494,7 @@ if __name__ == "__main__":
                 print("Computing NFW reference score...", flush=True)
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="reimporting")
-                    nfw_score = compute_nfw_scores(binned, fit_config)
+                    nfw_score, nfw_bic = compute_nfw_scores(binned, fit_config)
                 print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s",
                       flush=True)
 

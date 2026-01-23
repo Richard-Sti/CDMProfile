@@ -26,7 +26,6 @@ import cdmprof
 import esr.generation.duplicate_checker  # noqa
 import esr.generation.generator as generator  # noqa
 import numpy as np
-from mpi4py import MPI
 
 from utils import read_config
 
@@ -61,7 +60,46 @@ def _check_equation(idx, eq):
     return None
 
 
-def _compute_asymptote(idx, eq, verbose=False, rank=0):
+def _compute_single_limit(eq, limit_type):
+    """
+    Compute a single limit (helper for timeout wrapper).
+
+    Parameters
+    ----------
+    eq : str
+        The equation string.
+    limit_type : str
+        'zero' for lim(x->0+) or 'inf' for lim(x->inf).
+
+    Returns
+    -------
+    str
+        The limit result as a string.
+    """
+    from sympy import limit, oo, symbols, sympify
+
+    x = symbols('x', positive=True)
+    params = [symbols(f'a{i}', real=True) for i in range(4)]
+    local_dict = {'x': x}
+    local_dict.update({f'a{i}': params[i] for i in range(4)})
+
+    expr = sympify(eq, locals=local_dict)
+    if limit_type == 'zero':
+        return str(limit(expr, x, 0, '+'))
+    else:  # 'inf'
+        return str(limit(expr, x, oo))
+
+
+def _limit_worker(queue, eq, limit_type):
+    """Worker function for multiprocessing limit computation."""
+    try:
+        result = _compute_single_limit(eq, limit_type)
+        queue.put(result)
+    except Exception:
+        queue.put("unknown")
+
+
+def _compute_asymptote(idx, eq, verbose=False, rank=0, timeout=15):
     """
     Compute limits as x -> 0+ and x -> infinity for an equation.
 
@@ -75,47 +113,66 @@ def _compute_asymptote(idx, eq, verbose=False, rank=0):
         If True, print progress for each limit computation.
     rank : int, optional
         MPI rank (for verbose output).
+    timeout : int, optional
+        Timeout in seconds for each limit computation. Default: 15.
 
     Returns
     -------
     tuple
         (idx, eq, lim_zero, lim_inf) where limits are strings.
     """
-    from sympy import limit, oo, symbols, sympify
+    import multiprocessing as mp
 
-    x = symbols('x', positive=True)
-    # Don't assume sign for parameters - fitter allows [-500, 500]
-    params = [symbols(f'a{i}', real=True) for i in range(4)]
+    # Use 'spawn' context to avoid issues with MPI (fork can cause problems)
+    ctx = mp.get_context('spawn')
+    Process = ctx.Process
+    Queue = ctx.Queue
 
-    local_dict = {'x': x}
-    local_dict.update({f'a{i}': params[i] for i in range(4)})
-
+    # Compute lim(x->0+)
     if verbose:
         print(f"  [Rank {rank}] idx={idx} computing lim(x->0+): {eq}",
               flush=True)
-    try:
-        expr = sympify(eq, locals=local_dict)
-        lim_zero = limit(expr, x, 0, '+')
-        lim_zero_str = str(lim_zero)
-    except Exception:
-        # If SymPy can't compute it, mark as unknown (will pass by default)
-        lim_zero_str = "unknown"
+    queue = Queue()
+    proc = Process(target=_limit_worker, args=(queue, eq, 'zero'))
+    proc.start()
+    proc.join(timeout=timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        lim_zero_str = "timeout"
+        if verbose:
+            print(f"  [Rank {rank}] idx={idx} TIMEOUT on lim(x->0+)", flush=True)
+    else:
+        try:
+            lim_zero_str = queue.get_nowait()
+        except Exception:
+            lim_zero_str = "unknown"
 
+    # Compute lim(x->inf)
     if verbose:
         print(f"  [Rank {rank}] idx={idx} computing lim(x->inf): {eq}",
               flush=True)
-    try:
-        expr = sympify(eq, locals=local_dict)
-        lim_inf = limit(expr, x, oo)
-        lim_inf_str = str(lim_inf)
-    except Exception:
-        # If SymPy can't compute it, mark as unknown (will pass by default)
-        lim_inf_str = "unknown"
+    queue = Queue()
+    proc = Process(target=_limit_worker, args=(queue, eq, 'inf'))
+    proc.start()
+    proc.join(timeout=timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        lim_inf_str = "timeout"
+        if verbose:
+            print(f"  [Rank {rank}] idx={idx} TIMEOUT on lim(x->inf)", flush=True)
+    else:
+        try:
+            lim_inf_str = queue.get_nowait()
+        except Exception:
+            lim_inf_str = "unknown"
 
     return (idx, eq, lim_zero_str, lim_inf_str)
 
 
-def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
+def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False,
+                       timeout=15):
     """
     Compute asymptotic behavior for all equations (MPI parallelized).
 
@@ -135,6 +192,8 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
         Set of indices already rejected by validation (excluded from stats).
     verbose : bool, optional
         If True, print each limit computation (helps debug stuck limits).
+    timeout : int, optional
+        Timeout in seconds for each limit computation. Default: 15.
 
     Returns
     -------
@@ -170,10 +229,12 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
         'zero_param': 0,    # lim(x->0+) depends on parameters
         'zero_ok': 0,       # lim(x->0+) is positive (inf or const)
         'zero_unknown': 0,  # lim(x->0+) couldn't be computed
+        'zero_timeout': 0,  # lim(x->0+) computation timed out
         'inf_bad': 0,       # lim(x->inf) is non-zero constant or inf
         'inf_param': 0,     # lim(x->inf) depends on parameters
         'inf_ok': 0,        # lim(x->inf) is 0
         'inf_unknown': 0,   # lim(x->inf) couldn't be computed
+        'inf_timeout': 0,   # lim(x->inf) computation timed out
         'total_bad': 0,     # unique functions with ANY bad asymptote
         'total_param': 0,   # unique functions with param-dep (no bad)
         'total_unknown': 0,  # unknown asymptotes (post-fit check)
@@ -193,7 +254,7 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
     n_local = len(local_indices)
     for i, idx in enumerate(local_indices):
         result = _compute_asymptote(idx, equations[idx], verbose=verbose,
-                                    rank=rank)
+                                    rank=rank, timeout=timeout)
         local_results.append(result)
 
         # Progress indicator (each rank prints its own progress)
@@ -243,6 +304,10 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
             elif lim_zero in ("-oo", "-inf"):
                 stats['zero_bad'] += 1
                 zero_cat = 'bad'
+            elif lim_zero == "timeout":
+                # Computation timed out - needs post-fit check
+                stats['zero_timeout'] += 1
+                zero_cat = 'unknown'
             elif lim_zero == "unknown":
                 # SymPy couldn't compute - needs post-fit check
                 stats['zero_unknown'] += 1
@@ -283,6 +348,10 @@ def compute_asymptotes(targetdir, comp, comm, skip_idx=None, verbose=False):
             elif lim_inf in ("oo", "-oo", "zoo", "inf", "-inf"):
                 stats['inf_bad'] += 1
                 inf_cat = 'bad'
+            elif lim_inf == "timeout":
+                # Computation timed out - needs post-fit check
+                stats['inf_timeout'] += 1
+                inf_cat = 'unknown'
             elif lim_inf == "unknown":
                 # SymPy couldn't compute - needs post-fit check
                 stats['inf_unknown'] += 1
@@ -453,6 +522,7 @@ def print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats):
     print(f"     > 0, definite (OK):    {asymp_stats['zero_ok']:>5}")
     print(f"     param-dependent:       {asymp_stats['zero_param']:>5}")
     print(f"     unknown (post-fit):    {asymp_stats['zero_unknown']:>5}")
+    print(f"     timeout (post-fit):    {asymp_stats['zero_timeout']:>5}")
 
     # Show x->inf breakdown
     print("   lim(x->inf):")
@@ -460,6 +530,7 @@ def print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats):
     print(f"     = 0, definite (OK):    {asymp_stats['inf_ok']:>5}")
     print(f"     param-dependent:       {asymp_stats['inf_param']:>5}")
     print(f"     unknown (post-fit):    {asymp_stats['inf_unknown']:>5}")
+    print(f"     timeout (post-fit):    {asymp_stats['inf_timeout']:>5}")
 
     # Combined rejections (use total_bad to avoid double-counting)
     n_asymp_bad = asymp_stats['total_bad']
@@ -489,10 +560,15 @@ def print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats):
 
 
 if __name__ == "__main__":
+    from mpi4py import MPI
+
     parser = ArgumentParser()
     parser.add_argument("--runname", type=str,
                         help="ESR run name, defining the basis functions.")
     parser.add_argument("--comp", type=int, help="Function complexity.")
+    parser.add_argument("--asymp-timeout", type=int, default=15,
+                        help="Timeout (seconds) for each asymptote limit "
+                             "computation. Default: 15.")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -502,6 +578,7 @@ if __name__ == "__main__":
         print(f"\nGenerating functions for complexity {args.comp}...")
         print(f"Run name: {args.runname}")
         print(f"MPI ranks: {size}")
+        print(f"Asymptote timeout: {args.asymp_timeout}s")
         print("")
 
     # Run the generator
@@ -552,7 +629,8 @@ if __name__ == "__main__":
     # Compute asymptotic behavior (all ranks participate)
     # Pass skip_idx so stats only count non-skipped functions
     asymp_stats = compute_asymptotes(targetdir, args.comp, comm, skip_idx,
-                                     verbose=asymp_verbose)
+                                     verbose=asymp_verbose,
+                                     timeout=args.asymp_timeout)
 
     # Broadcast asymp_stats to rank 0
     asymp_stats = comm.bcast(asymp_stats, root=0)
