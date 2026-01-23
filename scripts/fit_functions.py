@@ -1510,10 +1510,10 @@ if __name__ == "__main__":
             # Save results to text files if enabled
             if fit_config.get('save_text_results', True):
                 t0 = time()
-                write_ranking_to_file(output_path, equations, npart_per_halo,
-                                      nfw_score=nfw_score,
-                                      min_success_fraction=min_success_frac,
-                                      failure_loss_percentile=failure_percentile)
+                write_ranking_to_file(
+                    output_path, equations, npart_per_halo,
+                    nfw_score=nfw_score, min_success_fraction=min_success_frac,
+                    failure_loss_percentile=failure_percentile)
                 print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
                       flush=True)
                 t0 = time()
@@ -1545,4 +1545,5 @@ if __name__ == "__main__":
                 print(f"  {'Total':<6} {format_time(total_fit):>10} "
                       f"{format_time(total_other):>10} "
                       f"{format_time(total_cpu):>10}", flush=True)
-                print(f"  Wall time: {format_time(total_mpi_time)}", flush=True)
+                print(f"  Wall time: {format_time(total_mpi_time)}",
+                      flush=True)
