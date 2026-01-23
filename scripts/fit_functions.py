@@ -132,6 +132,12 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
     if not output_path.exists():
         return
 
+    # Check if there are any results
+    with h5py.File(output_path, 'r') as f:
+        if 'func_idx' not in f:
+            print("No successful fits - skipping ranking file.")
+            return
+
     if txt_path is None:
         txt_path = output_path.with_suffix('.txt')
     else:

@@ -358,6 +358,12 @@ def print_best_results(output_path, equations, npart_per_halo,
         print("No results file found for ranking.")
         return
 
+    # Check if there are any results
+    with h5py.File(output_path, 'r') as f:
+        if 'func_idx' not in f:
+            print("\nNo successful fits to rank.")
+            return
+
     if asymp_postfit_funcs is None:
         asymp_postfit_funcs = set()
 
