@@ -2,8 +2,8 @@
 # Machine-specific paths are loaded from local_config.toml (not git tracked)
 
 [fitting]
-# Run name for equations (e.g., ext_maths)
-runname = "ext_maths"
+# Run name for equations (e.g., ext_maths, ext_maths_DM)
+runname = "ext_maths_DM"
 
 # Path to halo data (folder of .npy files or HDF5 file)
 # Can be overridden with --halos command line argument
