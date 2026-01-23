@@ -5,7 +5,7 @@ queue="berg"
 on_login=${1}
 nthreads=${2}
 complexities=${3}
-runname=${4:-"ext_maths"}
+runname=${4:-"ext_maths_DM"}
 
 # Check required arguments
 if [ -z "$on_login" ] || [ -z "$nthreads" ] || [ -z "$complexities" ]; then
@@ -15,7 +15,10 @@ if [ -z "$on_login" ] || [ -z "$nthreads" ] || [ -z "$complexities" ]; then
     echo "  on_login     1 to run locally, 0 to submit to queue (required)"
     echo "  nthreads     Number of threads (required)"
     echo "  complexities Function complexity or comma-separated list (required)"
-    echo "  runname      ESR run name (default: ext_maths)"
+    echo "  runname      ESR run name (default: ext_maths_DM)"
+    echo ""
+    echo "Note: Asymptote computation is SKIPPED by default (slow)."
+    echo "      To enable, edit the script and add --asymptotes flag."
     echo ""
     echo "Example:"
     echo "  ./generate_functions.sh 1 4 5             # Run complexity 5 locally"

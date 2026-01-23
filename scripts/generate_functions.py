@@ -487,7 +487,8 @@ def validate_equations(targetdir, comp, comm):
     return (n_equations, n_no_x, n_norm_only, n_bad, skip_idx)
 
 
-def print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats):
+def print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats,
+                  asymptotes_computed=True):
     """Print a progressive filtering summary."""
     print("")
     print("=" * 70)
@@ -515,44 +516,58 @@ def print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats):
     print(f"\n4. Remove bad (trig/nan/inf):    -{n_bad:>5} ({pct:>5.1f}%)")
     print(f"   Remaining:                    {remaining3:>6}")
 
-    # Step 5: Asymptotes
-    print("\n5. Asymptotic behavior analysis:")
+    # Step 5: Asymptotes (only if computed)
+    if asymptotes_computed:
+        print("\n5. Asymptotic behavior analysis:")
 
-    # Show x->0+ breakdown
-    print("   lim(x->0+):")
-    print(f"     <= 0 (rejected):       {asymp_stats['zero_bad']:>5}")
-    print(f"     > 0, definite (OK):    {asymp_stats['zero_ok']:>5}")
-    print(f"     param-dependent:       {asymp_stats['zero_param']:>5}")
-    print(f"     unknown (post-fit):    {asymp_stats['zero_unknown']:>5}")
-    print(f"     timeout (post-fit):    {asymp_stats['zero_timeout']:>5}")
+        # Show x->0+ breakdown
+        print("   lim(x->0+):")
+        print(f"     <= 0 (rejected):       {asymp_stats['zero_bad']:>5}")
+        print(f"     > 0, definite (OK):    {asymp_stats['zero_ok']:>5}")
+        print(f"     param-dependent:       {asymp_stats['zero_param']:>5}")
+        print(f"     unknown (post-fit):    {asymp_stats['zero_unknown']:>5}")
+        print(f"     timeout (post-fit):    {asymp_stats['zero_timeout']:>5}")
 
-    # Show x->inf breakdown
-    print("   lim(x->inf):")
-    print(f"     != 0 (rejected):       {asymp_stats['inf_bad']:>5}")
-    print(f"     = 0, definite (OK):    {asymp_stats['inf_ok']:>5}")
-    print(f"     param-dependent:       {asymp_stats['inf_param']:>5}")
-    print(f"     unknown (post-fit):    {asymp_stats['inf_unknown']:>5}")
-    print(f"     timeout (post-fit):    {asymp_stats['inf_timeout']:>5}")
+        # Show x->inf breakdown
+        print("   lim(x->inf):")
+        print(f"     != 0 (rejected):       {asymp_stats['inf_bad']:>5}")
+        print(f"     = 0, definite (OK):    {asymp_stats['inf_ok']:>5}")
+        print(f"     param-dependent:       {asymp_stats['inf_param']:>5}")
+        print(f"     unknown (post-fit):    {asymp_stats['inf_unknown']:>5}")
+        print(f"     timeout (post-fit):    {asymp_stats['inf_timeout']:>5}")
 
-    # Combined rejections (use total_bad to avoid double-counting)
-    n_asymp_bad = asymp_stats['total_bad']
-    remaining4 = remaining3 - n_asymp_bad
-    pct = 100 * n_asymp_bad / n_total if n_total > 0 else 0
-    print(f"\n   Rejected (bad asymp):     -{n_asymp_bad:>5} ({pct:>5.1f}%)")
-    print(f"   Remaining:                    {remaining4:>6}")
+        # Combined rejections (use total_bad to avoid double-counting)
+        n_asymp_bad = asymp_stats['total_bad']
+        remaining4 = remaining3 - n_asymp_bad
+        pct = 100 * n_asymp_bad / n_total if n_total > 0 else 0
+        print(
+            f"\n   Rejected (bad asymp):     -{n_asymp_bad:>5} ({pct:>5.1f}%)")
+        print(f"   Remaining:                    {remaining4:>6}")
 
-    # Final summary
-    n_param_dep = asymp_stats['total_param']
-    n_unknown = asymp_stats['total_unknown']
-    n_ready = asymp_stats['total_ok']
-    print("\n" + "-" * 70)
-    print("READY FOR FITTING:")
-    print(f"  Definitely valid:              {n_ready:>6}")
-    print(f"  Parameter-dependent:           {n_param_dep:>6}")
-    print(f"  Unknown (post-fit check):      {n_unknown:>6}")
-    print(f"  Total to fit:                  {remaining4:>6}")
+        # Final summary
+        n_param_dep = asymp_stats['total_param']
+        n_unknown = asymp_stats['total_unknown']
+        n_ready = asymp_stats['total_ok']
+        print("\n" + "-" * 70)
+        print("READY FOR FITTING:")
+        print(f"  Definitely valid:              {n_ready:>6}")
+        print(f"  Parameter-dependent:           {n_param_dep:>6}")
+        print(f"  Unknown (post-fit check):      {n_unknown:>6}")
+        print(f"  Total to fit:                  {remaining4:>6}")
 
-    total_eliminated = n_total - remaining4
+        total_eliminated = n_total - remaining4
+    else:
+        print("\n5. Asymptotic behavior analysis: SKIPPED")
+        print("   (use --asymptotes flag to enable)")
+        remaining4 = remaining3
+
+        print("\n" + "-" * 70)
+        print("READY FOR FITTING:")
+        print(f"  Total to fit:                  {remaining4:>6}")
+        print("  (asymptote filtering will happen during fitting)")
+
+        total_eliminated = n_total - remaining4
+
     pct_eliminated = 100 * total_eliminated / n_total if n_total > 0 else 0
     pct_remaining = 100 * remaining4 / n_total if n_total > 0 else 0
     print(f"\n  Eliminated:  {total_eliminated:>6} ({pct_eliminated:.1f}%)")
@@ -568,6 +583,9 @@ if __name__ == "__main__":
     parser.add_argument("--runname", type=str,
                         help="ESR run name, defining the basis functions.")
     parser.add_argument("--comp", type=int, help="Function complexity.")
+    parser.add_argument("--asymptotes", action="store_true",
+                        help="Compute asymptotic limits (slow). "
+                             "If not set, asymptote computation is skipped.")
     parser.add_argument("--asymp-timeout", type=int, default=5,
                         help="Timeout (seconds) for each asymptote limit "
                              "computation. Default: 5.")
@@ -580,7 +598,10 @@ if __name__ == "__main__":
         print(f"\nGenerating functions for complexity {args.comp}...")
         print(f"Run name: {args.runname}")
         print(f"MPI ranks: {size}")
-        print(f"Asymptote timeout: {args.asymp_timeout}s")
+        if args.asymptotes:
+            print(f"Asymptote computation: enabled (timeout={args.asymp_timeout}s)")  # noqa
+        else:
+            print("Asymptote computation: disabled")
         print("")
 
     # Run the generator
@@ -620,31 +641,45 @@ if __name__ == "__main__":
     n_total, n_no_x, n_norm_only, n_bad = counts
     skip_idx = comm.bcast(skip_idx, root=0)
 
-    # Read config for verbose flag
-    config = None
-    if rank == 0:
-        config = read_config()
-        print("Computing asymptotes...")
-    config = comm.bcast(config, root=0)
-    asymp_verbose = config.get("fitting", {}).get("asymp_verbose", False)
+    # Compute asymptotic behavior if requested
+    if args.asymptotes:
+        # Read config for verbose flag
+        config = None
+        if rank == 0:
+            config = read_config()
+            print("Computing asymptotes...")
+        config = comm.bcast(config, root=0)
+        asymp_verbose = config.get("fitting", {}).get("asymp_verbose", False)
 
-    # Compute asymptotic behavior (all ranks participate)
-    # Pass skip_idx so stats only count non-skipped functions
-    asymp_stats = compute_asymptotes(targetdir, args.comp, comm, skip_idx,
-                                     verbose=asymp_verbose,
-                                     timeout=args.asymp_timeout)
+        # Compute asymptotic behavior (all ranks participate)
+        # Pass skip_idx so stats only count non-skipped functions
+        asymp_stats = compute_asymptotes(targetdir, args.comp, comm, skip_idx,
+                                         verbose=asymp_verbose,
+                                         timeout=args.asymp_timeout)
 
-    # Broadcast asymp_stats to rank 0
-    asymp_stats = comm.bcast(asymp_stats, root=0)
+        # Broadcast asymp_stats to rank 0
+        asymp_stats = comm.bcast(asymp_stats, root=0)
+    else:
+        # Empty stats when asymptotes are skipped
+        asymp_stats = {
+            'zero_bad': 0, 'zero_param': 0, 'zero_ok': 0,
+            'zero_unknown': 0, 'zero_timeout': 0,
+            'inf_bad': 0, 'inf_param': 0, 'inf_ok': 0,
+            'inf_unknown': 0, 'inf_timeout': 0,
+            'total_bad': 0, 'total_param': 0, 'total_unknown': 0,
+            'total_ok': 0,
+        }
 
     # Print summary on rank 0
     if rank == 0:
-        print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats)
+        print_summary(n_total, n_no_x, n_norm_only, n_bad, asymp_stats,
+                      asymptotes_computed=args.asymptotes)
 
         # Print output file locations
         print("Output files:")
         print(f"  {join(targetdir, f'unique_equations_{args.comp}.txt')}")
         print(f"  {join(targetdir, f'skip_functions_{args.comp}.txt')}")
-        print(f"  {join(targetdir, f'asymptotes_zero_{args.comp}.txt')}")
-        print(f"  {join(targetdir, f'asymptotes_inf_{args.comp}.txt')}")
+        if args.asymptotes:
+            print(f"  {join(targetdir, f'asymptotes_zero_{args.comp}.txt')}")
+            print(f"  {join(targetdir, f'asymptotes_inf_{args.comp}.txt')}")
         print("")
