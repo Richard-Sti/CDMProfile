@@ -44,6 +44,16 @@ DONE_TAG = 0
 MAX_NPARAMS = 10
 
 
+def format_time(seconds):
+    """Format time in appropriate units (s, min, or h)."""
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    elif seconds >= 60:
+        return f"{seconds / 60:.1f}m"
+    else:
+        return f"{seconds:.1f}s"
+
+
 def get_param_dependent_value(config_value, nfree):
     """
     Get a config value that depends on the number of free parameters.
@@ -1509,13 +1519,15 @@ if __name__ == "__main__":
                 print(f"  {'-'*6} {'-'*10} {'-'*10} {'-'*10}", flush=True)
                 for rank_i, (fit_t, total_t) in worker_timings:
                     other_t = total_t - fit_t
-                    print(f"  {rank_i:<6} {fit_t:>9.1f}s {other_t:>9.1f}s "
-                          f"{total_t:>9.1f}s", flush=True)
+                    print(f"  {rank_i:<6} {format_time(fit_t):>10} "
+                          f"{format_time(other_t):>10} "
+                          f"{format_time(total_t):>10}", flush=True)
                 # Print totals
                 total_fit = sum(t[0] for _, t in worker_timings)
                 total_cpu = sum(t[1] for _, t in worker_timings)
                 total_other = total_cpu - total_fit
                 print(f"  {'-'*6} {'-'*10} {'-'*10} {'-'*10}", flush=True)
-                print(f"  {'Total':<6} {total_fit:>9.1f}s "
-                      f"{total_other:>9.1f}s {total_cpu:>9.1f}s", flush=True)
-                print(f"  Wall time: {total_mpi_time:.1f}s", flush=True)
+                print(f"  {'Total':<6} {format_time(total_fit):>10} "
+                      f"{format_time(total_other):>10} "
+                      f"{format_time(total_cpu):>10}", flush=True)
+                print(f"  Wall time: {format_time(total_mpi_time)}", flush=True)
