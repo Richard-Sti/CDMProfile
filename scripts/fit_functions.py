@@ -141,10 +141,16 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
         compute_function_scores(output_path, npart_per_halo,
                                 min_success_fraction, failure_loss_percentile)
 
+    # Find best BIC for dBIC computation
+    if scores:
+        best_bic = min(s[2] for s in scores)
+    else:
+        best_bic = 0
+
     with open(txt_path, 'w') as f:
         f.write("# Best functions ranked by avg loss/npart per halo\n")
         f.write("# Lower score is better\n")
-        f.write("# BIC = k*ln(n) + 2*loss (k = number of params)\n")
+        f.write("# dBIC = BIC - BIC_best; BIC = k*ln(n) + 2*loss\n")
         if failure_loss_percentile > 0:
             f.write(f"# Failed halos imputed with p{failure_loss_percentile} "
                     f"of successful fits\n")
@@ -157,15 +163,16 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
         if nfw_score is not None:
             nfw_str = f"# NFW reference: score={nfw_score:.6f}"
             if nfw_bic is not None:
-                nfw_str += f", BIC={nfw_bic:.6f}"
+                nfw_str += f", dBIC={nfw_bic - best_bic:.6f}"
             f.write(nfw_str + "\n")
         f.write("#\n")
-        f.write("# Columns: rank, func_idx, avg_score, avg_bic, nparams, "
+        f.write("# Columns: rank, func_idx, avg_score, dBIC, nparams, "
                 "n_halos, asymp_inf%, asymp_zero%, equation\n")
         f.write("#\n")
 
         for rank, (fidx, score, bic, nparams, n_halos) in enumerate(scores, 1):
             eq = equations[fidx]
+            dbic = bic - best_bic
             if fidx in asymp_pass_dict:
                 n_inf, n_zero, n_total = asymp_pass_dict[fidx]
                 if n_total > 0:
@@ -176,7 +183,7 @@ def write_ranking_to_file(output_path, equations, npart_per_halo,
             else:
                 pct_inf, pct_zero = -1, -1
 
-            f.write(f"{rank}\t{fidx}\t{score:.6f}\t{bic:.6f}\t{nparams}\t"
+            f.write(f"{rank}\t{fidx}\t{score:.6f}\t{dbic:.1f}\t{nparams}\t"
                     f"{n_halos}\t{pct_inf:.0f}\t{pct_zero:.0f}\t{eq}\n")
 
     print(f"Ranking saved to: {txt_path}")
@@ -508,7 +515,7 @@ class ResultsFile:
     """
 
     # Core result dataset names
-    RESULT_FIELDS = ['func_idx', 'halo_idx', 'loss', 'params',
+    RESULT_FIELDS = ['func_idx', 'halo_idx', 'loss', 'params', 'nparams',
                      'converged', 'neval']
     # Asymptote pass fraction field names
     ASYMP_PASS_FIELDS = ['asymp_pass_func_idx', 'asymp_pass_inf',
@@ -612,13 +619,16 @@ class ResultsFile:
                 'converged': np.array([r[4] for r in new_results], np.int32),
                 'neval': np.array([r[5] for r in new_results], np.int32),
             }
-            # Pad params to fixed size
+            # Pad params to fixed size and store nparams
             params = np.full((len(new_results), MAX_NPARAMS), np.nan,
                              dtype=np.float64)
+            nparams = np.zeros(len(new_results), dtype=np.int32)
             for i, r in enumerate(new_results):
                 n = min(len(r[3]), MAX_NPARAMS)
                 params[i, :n] = r[3][:n]
+                nparams[i] = len(r[3])
             arrays['params'] = params
+            arrays['nparams'] = nparams
 
         mode = 'a' if self.exists() else 'w'
         with h5py.File(self.path, mode) as f:

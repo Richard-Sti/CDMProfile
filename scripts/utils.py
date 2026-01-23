@@ -265,7 +265,13 @@ def compute_function_scores(output_path, npart_per_halo,
         func_idx = f['func_idx'][:]
         halo_idx = f['halo_idx'][:]
         loss = f['loss'][:]
-        params = f['params'][:]
+
+        # Read nparams directly if available, otherwise compute from params
+        if 'nparams' in f:
+            nparams_per_result = f['nparams'][:]
+        else:
+            params = f['params'][:]
+            nparams_per_result = np.sum(~np.isnan(params), axis=1)
 
         if 'asymp_pass_func_idx' in f:
             apf_idx = f['asymp_pass_func_idx'][:]
@@ -279,9 +285,6 @@ def compute_function_scores(output_path, npart_per_halo,
     npart_per_halo = np.asarray(npart_per_halo)
     n_halos_total = len(npart_per_halo)
     normalized_loss = loss / npart_per_halo[halo_idx]
-
-    # Compute nparams per result (count non-NaN params)
-    nparams_per_result = np.sum(~np.isnan(params), axis=1)
 
     # Compute BIC per result: BIC = k * ln(n) + 2 * loss
     npart_per_result = npart_per_halo[halo_idx]
@@ -363,22 +366,29 @@ def print_best_results(output_path, equations, npart_per_halo,
         failure_loss_percentile)
     scores, asymp_pass_dict, n_halos_total, n_filtered = result
 
+    # Find best BIC for dBIC computation
+    if scores:
+        best_bic = min(s[2] for s in scores)
+    else:
+        best_bic = 0
+
     if nfw_score is not None:
-        print("\n" + "-" * 89)
+        print("\n" + "-" * 95)
         nfw_str = f"NFW REFERENCE: AvgScore = {nfw_score:.4f}"
         if nfw_bic is not None:
-            nfw_str += f", AvgBIC = {nfw_bic:.4f}"
+            nfw_dbic = nfw_bic - best_bic
+            nfw_str += f", dBIC = {nfw_dbic:.1f}"
         nfw_str += "  (rho = 1 / (x * (1 + x)^2))"
         print(nfw_str)
-        print("-" * 89)
+        print("-" * 95)
 
-    print("\n" + "=" * 89)
+    print("\n" + "=" * 95)
     print("TOP FUNCTIONS (ranked by avg loss/npart per halo, lower is better)")
-    print("=" * 89)
-    header = f"{'Rank':<6} {'Func#':<7} {'AvgScore':<10} {'AvgBIC':<10} "
+    print("=" * 95)
+    header = f"{'Rank':<6} {'Func#':<7} {'AvgScore':<10} {'dBIC':<10} "
     header += f"{'k':<3} {'#Halo':<6} {'Asymp':<7} Equation"
     print(header)
-    print("-" * 89)
+    print("-" * 95)
 
     for rank, (fidx, score, bic, nparams, n_halos) in enumerate(scores[:n_top], 1):
         eq = equations[fidx]
@@ -396,11 +406,12 @@ def print_best_results(output_path, equations, npart_per_halo,
             asymp_status = "?"
         else:
             asymp_status = "-"
-        row = f"{rank:<6} {fidx:<7} {score:<10.4f} {bic:<10.4f} "
+        dbic = bic - best_bic
+        row = f"{rank:<6} {fidx:<7} {score:<10.4f} {dbic:<10.1f} "
         row += f"{nparams:<3} {n_halos:<6} {asymp_status:<7} {eq}"
         print(row)
 
-    print("=" * 89)
+    print("=" * 95)
     print(f"Showing top {min(n_top, len(scores))} of {len(scores)} functions")
     if n_filtered > 0:
         min_halos = int(min_success_fraction * n_halos_total)
@@ -411,6 +422,6 @@ def print_best_results(output_path, equations, npart_per_halo,
               f"p{failure_loss_percentile})")
     else:
         print("(AvgScore = mean of loss/npart over successful fits only)")
-    print("(BIC = k*ln(n) + 2*loss; k = number of params)")
+    print("(dBIC = BIC - BIC_best; BIC = k*ln(n) + 2*loss)")
     print("(Asymp: inf%/zero% pass fractions for x->inf and x->0+ checks)")
     print("")
