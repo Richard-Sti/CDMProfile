@@ -57,16 +57,18 @@ void simpson_grid_init(SimpsonGrid* grid, double rmin, double rmax);
  * Simpson's rule integration using precomputed grid.
  *
  * Parameters:
- *   rho   - Density function pointer
- *   grid  - Precomputed Simpson grid
- *   Rs    - Scale radius
- *   a0-a3 - Free parameters
+ *   rho         - Density function pointer
+ *   grid        - Precomputed Simpson grid
+ *   Rs          - Scale radius
+ *   a0-a3       - Free parameters
+ *   min_density - Minimum allowed density (underflow protection)
  *
  * Returns:
  *   Enclosed mass (unnormalized), or -1.0 if invalid
  */
 double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
-                    double Rs, double a0, double a1, double a2, double a3);
+                    double Rs, double a0, double a1, double a2, double a3,
+                    double min_density);
 
 /*
  * Compute the negative log-likelihood loss for fitting a density profile.
@@ -83,6 +85,7 @@ double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
  *   rho           - Density function pointer
  *   Rs            - Scale radius
  *   a0-a3         - Free parameters
+ *   min_density   - Minimum allowed density (underflow protection)
  *
  * Returns:
  *   Loss value (large positive value if invalid)
@@ -90,6 +93,7 @@ double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
 double compute_loss(double* bin_counts, double* bin_positions, int nbin,
                     int npart, const SimpsonGrid* grid,
                     DensityFunc rho,
-                    double Rs, double a0, double a1, double a2, double a3);
+                    double Rs, double a0, double a1, double a2, double a3,
+                    double min_density);
 
 #endif /* CDMPROF_LOSS_H */

@@ -41,18 +41,20 @@ void simpson_grid_init(SimpsonGrid* grid, double rmin, double rmax) {
 
 
 double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
-                    double Rs, double a0, double a1, double a2, double a3) {
+                    double Rs, double a0, double a1, double a2, double a3,
+                    double min_density) {
     /*
      * Simpson's 1/3 rule for integrating 4*pi*r^2*rho(r) using precomputed grid.
      * Uses SIMPSON_N intervals (SIMPSON_N+1 points). SIMPSON_N must be even.
      * Also checks that the density profile is monotonically decreasing.
+     * Rejects if density falls below min_density (underflow protection).
      */
     double sum = 0.0;
     double rho_prev;
 
     /* First point: weight 1 */
     double rho_val = rho(grid->r[0], Rs, a0, a1, a2, a3);
-    if (!isfinite(rho_val) || rho_val <= 0.0) return -1.0;
+    if (!isfinite(rho_val) || rho_val < min_density) return -1.0;
     sum += grid->r3[0] * rho_val;
     rho_prev = rho_val;
 
@@ -60,7 +62,7 @@ double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
     for (int i = 1; i < SIMPSON_N; i += 2) {
         /* Odd index: weight 4 */
         rho_val = rho(grid->r[i], Rs, a0, a1, a2, a3);
-        if (!isfinite(rho_val) || rho_val <= 0.0 || rho_val > rho_prev)
+        if (!isfinite(rho_val) || rho_val < min_density || rho_val > rho_prev)
             return -1.0;
         sum += 4.0 * grid->r3[i] * rho_val;
         rho_prev = rho_val;
@@ -68,7 +70,7 @@ double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
         /* Even index: weight 2 (skip if this is the last point) */
         if (i + 1 < SIMPSON_N) {
             rho_val = rho(grid->r[i + 1], Rs, a0, a1, a2, a3);
-            if (!isfinite(rho_val) || rho_val <= 0.0 || rho_val > rho_prev)
+            if (!isfinite(rho_val) || rho_val < min_density || rho_val > rho_prev)
                 return -1.0;
             sum += 2.0 * grid->r3[i + 1] * rho_val;
             rho_prev = rho_val;
@@ -77,7 +79,7 @@ double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
 
     /* Last point: weight 1 */
     rho_val = rho(grid->r[SIMPSON_N], Rs, a0, a1, a2, a3);
-    if (!isfinite(rho_val) || rho_val <= 0.0 || rho_val > rho_prev)
+    if (!isfinite(rho_val) || rho_val < min_density || rho_val > rho_prev)
         return -1.0;
     sum += grid->r3[SIMPSON_N] * rho_val;
 
@@ -89,7 +91,8 @@ double simpson_mass(DensityFunc rho, const SimpsonGrid* grid,
 double compute_loss(double* bin_counts, double* bin_positions, int nbin,
                     int npart, const SimpsonGrid* grid,
                     DensityFunc rho,
-                    double Rs, double a0, double a1, double a2, double a3) {
+                    double Rs, double a0, double a1, double a2, double a3,
+                    double min_density) {
     /*
      * Compute the negative log-likelihood loss.
      *
@@ -101,7 +104,7 @@ double compute_loss(double* bin_counts, double* bin_positions, int nbin,
 
     /* Check density at r=0: if finite, must be positive */
     double rho_zero = rho(0.0, Rs, a0, a1, a2, a3);
-    if (isfinite(rho_zero) && rho_zero <= 0.0) {
+    if (isfinite(rho_zero) && rho_zero < min_density) {
         return DBL_MAX;
     }
 
@@ -147,7 +150,7 @@ double compute_loss(double* bin_counts, double* bin_positions, int nbin,
         double rho_val = rho(r_i, Rs, a0, a1, a2, a3);
 
         /* Invalid density: return large loss */
-        if (!isfinite(rho_val) || rho_val <= 0.0) {
+        if (!isfinite(rho_val) || rho_val < min_density) {
             return DBL_MAX;
         }
 
@@ -155,7 +158,7 @@ double compute_loss(double* bin_counts, double* bin_positions, int nbin,
     }
 
     /* Compute enclosed mass via Simpson integration */
-    double mass = simpson_mass(rho, grid, Rs, a0, a1, a2, a3);
+    double mass = simpson_mass(rho, grid, Rs, a0, a1, a2, a3, min_density);
 
     /* Invalid mass: return large loss */
     if (mass <= 0.0 || !isfinite(mass)) {
