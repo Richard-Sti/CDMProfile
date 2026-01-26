@@ -330,7 +330,8 @@ def compute_function_scores(output_path, npart_per_halo,
                 avg_scores[i] = (
                     sum_per_func[i] / n_success if n_success > 0 else np.inf)
                 avg_bic[i] = (
-                    sum_bic_per_func[i] / n_success if n_success > 0 else np.inf)
+                    sum_bic_per_func[i] / n_success
+                    if n_success > 0 else np.inf)
     else:
         # Original behavior: average over successful fits only
         avg_scores = sum_per_func / counts
@@ -372,31 +373,90 @@ def print_best_results(output_path, equations, npart_per_halo,
         failure_loss_percentile)
     scores, asymp_pass_dict, n_halos_total, n_filtered = result
 
+    # Estimate σ_CE (cross-entropy uncertainty) for the best function
+    if scores:
+        best_fidx = scores[0][0]
+        npart_arr = np.asarray(npart_per_halo)
+        n_total_particles = int(np.sum(npart_arr))
+
+        with h5py.File(output_path, 'r') as f:
+            all_func_idx = f['func_idx'][:]
+            all_halo_idx = f['halo_idx'][:]
+            all_loss = f['loss'][:]
+
+        # Per-halo CE for the best function
+        best_mask = all_func_idx == best_fidx
+        best_halo_idx = all_halo_idx[best_mask]
+        best_ce = all_loss[best_mask] / npart_arr[best_halo_idx]
+        n_halos_best = len(best_ce)
+
+        if n_halos_best > 1:
+            sigma_ce_halos = np.std(best_ce, ddof=1)
+        else:
+            sigma_ce_halos = 0.0
+        sigma_ce = (sigma_ce_halos / np.sqrt(n_halos_best)
+                    if n_halos_best > 0 else 0.0)
+
+        print(f"\nCROSS-ENTROPY UNCERTAINTY (from best function, "
+              f"func #{best_fidx})")
+        print("-" * 70)
+        print(f"  N_halos          = {n_halos_best}")
+        print(f"  N_particles      = {n_total_particles:,}")
+        print(f"  Best CE (mean)   = {scores[0][1]:.6f}")
+        print(f"  sigma_CE (halo)  = {sigma_ce_halos:.6f}  "
+              f"(std of per-halo CE)")
+        print(f"  sigma_CE (mean)  = {sigma_ce:.6f}  "
+              f"(std error of mean CE)")
+        print("\n  Interpretation: when is Delta_CE meaningful?")
+        print(f"  {'Delta_CE':<15} {'Significance':<20} {'Meaning'}")
+        print(f"  {'-' * 60}")
+
+        thresholds = [
+            (0.5 * sigma_ce, "< 0.5 sigma_CE", "Indistinguishable"),
+            (1.0 * sigma_ce, "~ 1 sigma_CE", "Marginal"),
+            (2.0 * sigma_ce, "~ 2 sigma_CE", "Likely meaningful"),
+            (3.0 * sigma_ce, "~ 3 sigma_CE", "Significant"),
+        ]
+        for thresh, label, meaning in thresholds:
+            print(f"  {thresh:<15.6f} {label:<20} {meaning}")
+
+        print(f"\n  Delta_CE < {sigma_ce:.6f} is within noise "
+              f"for this dataset.")
+        print("")
+
     # Find best BIC for dBIC computation
     if scores:
         best_bic = min(s[2] for s in scores)
     else:
         best_bic = 0
 
+    # Best CE for Delta_CE computation
+    best_ce_val = scores[0][1] if scores else 0.0
+
     if nfw_score is not None:
-        print("\n" + "-" * 95)
-        nfw_str = f"NFW REFERENCE: AvgScore = {nfw_score:.4f}"
+        print("\n" + "-" * 109)
+        nfw_dce = nfw_score - best_ce_val
+        nfw_str = f"NFW REFERENCE: CE = {nfw_score:.6f}"
+        nfw_str += f", Delta_CE = {nfw_dce:.6f}"
         if nfw_bic is not None:
             nfw_dbic = nfw_bic - best_bic
             nfw_str += f", dBIC = {nfw_dbic:.1f}"
         nfw_str += "  (rho = 1 / (x * (1 + x)^2))"
         print(nfw_str)
-        print("-" * 95)
+        print("-" * 109)
 
-    print("\n" + "=" * 95)
-    print("TOP FUNCTIONS (ranked by avg loss/npart per halo, lower is better)")
-    print("=" * 95)
-    header = f"{'Rank':<6} {'Func#':<7} {'AvgScore':<10} {'dBIC':<10} "
-    header += f"{'k':<3} {'#Halo':<6} {'Asymp':<7} Equation"
+    print("\n" + "=" * 109)
+    print("TOP FUNCTIONS (ranked by CE = avg loss/npart, "
+          "lower is better)")
+    print("=" * 109)
+    header = (f"{'Rank':<6} {'Func#':<7} {'CE':<12} "
+              f"{'Delta_CE':<12} {'dBIC':<10} "
+              f"{'k':<3} {'#Halo':<6} {'Asymp':<7} Equation")
     print(header)
-    print("-" * 95)
+    print("-" * 109)
 
-    for rank, (fidx, score, bic, nparams, n_halos) in enumerate(scores[:n_top], 1):
+    for rank, (fidx, score, bic, nparams, n_halos) in enumerate(
+            scores[:n_top], 1):
         eq = equations[fidx]
         if len(eq) > 30:
             eq = eq[:27] + "..."
@@ -412,22 +472,28 @@ def print_best_results(output_path, equations, npart_per_halo,
             asymp_status = "?"
         else:
             asymp_status = "-"
+        dce = score - best_ce_val
         dbic = bic - best_bic
-        row = f"{rank:<6} {fidx:<7} {score:<10.4f} {dbic:<10.1f} "
-        row += f"{nparams:<3} {n_halos:<6} {asymp_status:<7} {eq}"
+        row = (f"{rank:<6} {fidx:<7} {score:<12.6f} "
+               f"{dce:<12.6f} {dbic:<10.1f} "
+               f"{nparams:<3} {n_halos:<6} {asymp_status:<7} {eq}")
         print(row)
 
-    print("=" * 95)
-    print(f"Showing top {min(n_top, len(scores))} of {len(scores)} functions")
+    print("=" * 109)
+    print(f"Showing top {min(n_top, len(scores))} of "
+          f"{len(scores)} functions")
     if n_filtered > 0:
         min_halos = int(min_success_fraction * n_halos_total)
-        print(f"(Filtered out {n_filtered} functions with < {min_halos} "
-              f"successful fits)")
+        print(f"(Filtered out {n_filtered} functions with "
+              f"< {min_halos} successful fits)")
     if failure_loss_percentile > 0:
-        print(f"(AvgScore = mean of loss/npart; failed halos imputed with "
-              f"p{failure_loss_percentile})")
+        print(f"(CE = mean of loss/npart; failed halos imputed "
+              f"with p{failure_loss_percentile})")
     else:
-        print("(AvgScore = mean of loss/npart over successful fits only)")
+        print("(CE = mean of loss/npart over successful "
+              "fits only)")
+    print("(Delta_CE = CE - CE_best)")
     print("(dBIC = BIC - BIC_best; BIC = k*ln(n) + 2*loss)")
-    print("(Asymp: inf%/zero% pass fractions for x->inf and x->0+ checks)")
+    print("(Asymp: inf%/zero% pass fractions for "
+          "x->inf and x->0+ checks)")
     print("")

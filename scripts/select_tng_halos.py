@@ -402,6 +402,94 @@ def load_dm_particles_for_halo(basepath, snap_num, halo_id, center, radius,
     return delta[within]
 
 
+def get_n_snapshot_chunks(basepath, snap_num):
+    """Return the number of chunk files for a snapshot."""
+    snap_dir = Path(basepath) / f"snapdir_{snap_num:03d}"
+    first_file = snap_dir / f"snap_{snap_num:03d}.0.hdf5"
+    with h5py.File(first_file, 'r') as f:
+        return f['Header'].attrs['NumFilesPerSnapshot']
+
+
+def sphere_cut_process_chunks(basepath, snap_num, chunk_ids, centers,
+                              radii, box_size, output_path, rank):
+    """
+    Process assigned snapshot chunks, finding DM particles within each
+    halo's radius. Write results to a temporary HDF5 file.
+
+    Each chunk is read once. For each chunk, all halos are checked.
+    Results are written as concatenated positions ordered by halo index,
+    with a counts array to reconstruct per-halo data.
+
+    Parameters
+    ----------
+    basepath : str
+        Path to TNG output directory.
+    snap_num : int
+        Snapshot number.
+    chunk_ids : array-like of int
+        Chunk file IDs this rank should process.
+    centers : ndarray (n_halos, 3)
+        Halo center positions (ALL halos).
+    radii : ndarray (n_halos,)
+        Radii for spherical cuts (e.g. R200c).
+    box_size : float
+        Periodic box size.
+    output_path : str or Path
+        Path to write temporary HDF5 file.
+    rank : int
+        MPI rank (for progress reporting).
+    """
+    snap_dir = Path(basepath) / f"snapdir_{snap_num:03d}"
+    n_halos = len(centers)
+    results = [[] for _ in range(n_halos)]
+    radii_sq = radii ** 2
+    n_chunks = len(chunk_ids)
+    report_every = max(1, n_chunks // 10)
+    particle_batch = 5_000_000
+
+    for ci, chunk_id in enumerate(chunk_ids):
+        chunk_path = snap_dir / f"snap_{snap_num:03d}.{chunk_id}.hdf5"
+        with h5py.File(chunk_path, 'r') as f:
+            if 'PartType1' not in f:
+                continue
+            dataset = f['PartType1']['Coordinates']
+            n_particles = dataset.shape[0]
+
+            for start in range(0, n_particles, particle_batch):
+                end = min(start + particle_batch, n_particles)
+                coords = dataset[start:end]
+
+                for i in range(n_halos):
+                    delta = coords - centers[i]
+                    delta -= box_size * np.round(delta / box_size)
+                    dist_sq = np.sum(delta**2, axis=1)
+                    mask = dist_sq < radii_sq[i]
+
+                    if mask.any():
+                        results[i].append(delta[mask])
+
+        if (ci + 1) % report_every == 0:
+            print(f"    [Rank {rank}] Chunk {ci + 1}/{n_chunks}")
+
+    # Write results to temporary HDF5
+    counts = np.zeros(n_halos, dtype=np.int64)
+    all_positions = []
+    for i in range(n_halos):
+        if results[i]:
+            cat = np.concatenate(results[i])
+            counts[i] = len(cat)
+            all_positions.append(cat)
+
+    with h5py.File(output_path, 'w') as f:
+        f.create_dataset("counts", data=counts)
+        if all_positions:
+            f.create_dataset("positions",
+                             data=np.concatenate(all_positions))
+        else:
+            f.create_dataset("positions",
+                             data=np.array([]).reshape(0, 3))
+
+
 def check_decreasing_outer_profile(pos, r200c, r_min_frac=0.6, r_max_frac=1.0,
                                    n_bins=10):
     """
@@ -498,83 +586,284 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
     subhalo_pos = subhalos['SubhaloPos']
     M200 = groups['Group_M_Crit200']
 
-    # Balance halos by mass
-    masses = M200[selected_indices]
-    rank_assignments, rank_loads = balance_halos_by_mass(
-        selected_indices, masses, size)
-    my_indices = np.array(rank_assignments[rank])
+    if args.sphere_cut:
+        # ---- Sphere cut: partition snapshot chunks across MPI ranks ----
+        # Each rank reads a unique subset of chunks and checks ALL halos.
+        # Results are written to per-rank temp files, then collected.
+        n_files = get_n_snapshot_chunks(basepath, snap_num)
+        all_chunk_ids = np.arange(n_files)
+        my_chunk_ids = np.array_split(all_chunk_ids, size)[rank]
 
-    if rank == 0:
-        print(f"\nExtracting particles for {len(selected_indices)} halos "
-              f"using {size} MPI ranks...")
-        print(f"  Load balance: min={rank_loads.min():.2e}, "
-              f"max={rank_loads.max():.2e} (10^10 Msun/h)")
+        # All halo centers and radii (every rank needs all halos)
+        all_centers = np.array(
+            [subhalo_pos[first_sub[g]] for g in selected_indices])
+        all_radii_arr = np.array([R200c[g] for g in selected_indices])
 
-    # Set random seed for reproducible subsampling (different per rank)
-    if args.subsample is not None:
-        np.random.seed(args.seed + rank)
+        if rank == 0:
+            print(f"\nSphere cut: partitioning {n_files} chunks across "
+                  f"{size} ranks ({len(selected_indices)} halos)")
 
-    # Each rank collects its halos' data
-    my_halo_ids = []
-    my_positions = []
-    my_npart = []
-    my_rejected_monotonic = 0
-    n_my_halos = len(my_indices)
-    report_every = max(1, n_my_halos // 10)
+        tmp_path = output_dir / f"_sphere_tmp_rank{rank}.hdf5"
+        print(f"  [Rank {rank}] Processing {len(my_chunk_ids)} chunks...")
+        sphere_cut_process_chunks(
+            basepath, snap_num, my_chunk_ids, all_centers, all_radii_arr,
+            box_size, tmp_path, rank)
+        print(f"  [Rank {rank}] Wrote temp file")
 
-    for i, group_idx in enumerate(my_indices):
-        central_idx = first_sub[group_idx]
-        center = subhalo_pos[central_idx]
-        radius = R200c[group_idx]
+        comm.Barrier()
 
-        pos = load_dm_particles_for_halo(
-            basepath, snap_num, group_idx, center, radius, box_size)
+        # Rank 0: stream from temp files directly to output HDF5
+        if rank == 0:
+            print("\n  Collecting results and writing output...")
+            n_halos = len(selected_indices)
 
-        if len(pos) == 0:
-            print(f"  [Rank {rank}] Warning: No particles for halo "
-                  f"{group_idx}")
-            continue
+            # Open all temp files and read counts (small arrays)
+            tmp_handles = []
+            tmp_counts = []
+            tmp_offsets = []
+            for r in range(size):
+                tmp_file = output_dir / f"_sphere_tmp_rank{r}.hdf5"
+                fh = h5py.File(tmp_file, 'r')
+                counts = fh['counts'][:]
+                file_offsets = np.zeros(n_halos + 1, dtype=np.int64)
+                file_offsets[1:] = np.cumsum(counts)
+                tmp_handles.append(fh)
+                tmp_counts.append(counts)
+                tmp_offsets.append(file_offsets)
 
-        # Check decreasing outer profile if requested
-        if args.check_monotonic:
-            if not check_decreasing_outer_profile(pos, radius):
-                my_rejected_monotonic += 1
+            # Create output file with resizable datasets
+            output_file = output_dir / f"particles_{args.snap:03d}.hdf5"
+            out_f = h5py.File(output_file, 'w')
+            dset_pos = out_f.create_dataset(
+                "positions", shape=(0, 3), maxshape=(None, 3),
+                dtype='f8', chunks=True)
+            dset_rad = out_f.create_dataset(
+                "radii", shape=(0,), maxshape=(None,),
+                dtype='f8', chunks=True)
+
+            halo_ids = []
+            npart_list = []
+            rejected_monotonic = 0
+
+            if args.subsample is not None:
+                np.random.seed(args.seed)
+
+            for i in range(n_halos):
+                group_idx = selected_indices[i]
+
+                # Read this halo's particles from each temp file
+                parts = []
+                for r in range(size):
+                    c = int(tmp_counts[r][i])
+                    if c > 0:
+                        start = int(tmp_offsets[r][i])
+                        parts.append(
+                            tmp_handles[r]['positions'][start:start + c])
+
+                if not parts:
+                    continue
+
+                pos = np.concatenate(parts)
+                del parts
+
+                if len(pos) == 0:
+                    continue
+
+                radius = all_radii_arr[i]
+
+                if args.check_monotonic:
+                    if not check_decreasing_outer_profile(pos, radius):
+                        rejected_monotonic += 1
+                        continue
+
+                if (args.subsample is not None
+                        and len(pos) > args.subsample):
+                    idx = np.random.choice(
+                        len(pos), args.subsample, replace=False)
+                    pos = pos[idx]
+
+                # Append to output HDF5 immediately
+                pos_radii = np.linalg.norm(pos, axis=1)
+                n_old = dset_pos.shape[0]
+                n_new = len(pos)
+                dset_pos.resize(n_old + n_new, axis=0)
+                dset_pos[n_old:] = pos
+                dset_rad.resize(n_old + n_new, axis=0)
+                dset_rad[n_old:] = pos_radii
+                del pos, pos_radii
+
+                halo_ids.append(group_idx)
+                npart_list.append(n_new)
+
+            # Close and clean up temp files
+            for r in range(size):
+                tmp_handles[r].close()
+                (output_dir / f"_sphere_tmp_rank{r}.hdf5").unlink()
+
+            if args.check_monotonic and rejected_monotonic > 0:
+                print(f"  Rejected {rejected_monotonic} halos with "
+                      f"non-monotonic outer profile")
+
+            # Write metadata datasets
+            halo_ids = np.array(halo_ids)
+            npart = np.array(npart_list)
+            total_particles = int(dset_pos.shape[0])
+
+            offsets_arr = np.zeros(len(halo_ids) + 1, dtype=np.int64)
+            offsets_arr[1:] = np.cumsum(npart)
+
+            out_f.create_dataset("halo_id", data=halo_ids)
+            out_f.create_dataset("offsets", data=offsets_arr)
+            out_f.create_dataset(
+                "M200c", data=M200[halo_ids] * 1e10)  # Msun/h
+            out_f.create_dataset(
+                "R200c", data=R200c[halo_ids])  # ckpc/h
+
+            out_f.attrs["snap_num"] = args.snap
+            out_f.attrs["redshift"] = header['Redshift']
+            out_f.attrs["box_size"] = header['BoxSize']
+            out_f.attrs["min_mass"] = args.min_mass
+            out_f.attrs["max_offset"] = args.max_offset
+            out_f.attrs["max_satellite_ratio"] = args.max_satellite_ratio
+            out_f.attrs["isolation_distance"] = args.isolation_distance
+            out_f.attrs["isolation_mass_ratio"] = args.isolation_mass_ratio
+            if args.subsample is not None:
+                out_f.attrs["subsample"] = args.subsample
+                out_f.attrs["seed"] = args.seed
+            out_f.attrs["sphere_cut"] = True
+            out_f.attrs["units_M200c"] = "Msun/h"
+            out_f.attrs["units_R200c"] = "ckpc/h"
+            out_f.attrs["units_box_size"] = "ckpc/h"
+            out_f.attrs["units_positions"] = (
+                "ckpc/h (relative to halo center)")
+            out_f.attrs["units_radii"] = (
+                "ckpc/h (distance from halo center)")
+            out_f.close()
+
+            # Compact: rewrite with contiguous storage (chunked
+            # datasets from streaming are slower to read)
+            print("  Compacting output file...")
+            tmp_compact = output_file.with_suffix('.tmp.hdf5')
+            compact_batch = 5_000_000
+            with (h5py.File(output_file, 'r') as fin,
+                  h5py.File(tmp_compact, 'w') as fout):
+                n_total = fin['positions'].shape[0]
+                dset_p = fout.create_dataset(
+                    'positions', shape=(n_total, 3), dtype='f8')
+                dset_r = fout.create_dataset(
+                    'radii', shape=(n_total,), dtype='f8')
+                for s in range(0, n_total, compact_batch):
+                    e = min(s + compact_batch, n_total)
+                    dset_p[s:e] = fin['positions'][s:e]
+                    dset_r[s:e] = fin['radii'][s:e]
+
+                for key in fin:
+                    if key not in ('positions', 'radii'):
+                        fin.copy(key, fout)
+                for key, val in fin.attrs.items():
+                    fout.attrs[key] = val
+
+            tmp_compact.replace(output_file)
+
+            print(f"  Processed {len(halo_ids)}/{n_halos} halos")
+            print(f"  Total particles: {total_particles:,}")
+
+            file_size = output_file.stat().st_size
+            if file_size > 1e9:
+                size_str = f"{file_size / 1e9:.2f} GB"
+            else:
+                size_str = f"{file_size / 1e6:.1f} MB"
+
+            print("\n" + "=" * 70)
+            print("OUTPUT FILE")
+            print("=" * 70)
+            print(f"  Path:       {output_file}")
+            print(f"  Size:       {size_str}")
+            print(f"  N halos:    {len(halo_ids)}")
+            print(f"  N particles: {total_particles:,}")
+            print("=" * 70)
+
+        return  # All ranks done for sphere-cut path
+
+    else:
+        # ---- FoF-based: partition halos across MPI ranks ----
+        masses = M200[selected_indices]
+        rank_assignments, rank_loads = balance_halos_by_mass(
+            selected_indices, masses, size)
+        my_indices = np.array(rank_assignments[rank])
+
+        if rank == 0:
+            print(f"\nExtracting particles for "
+                  f"{len(selected_indices)} halos "
+                  f"using {size} MPI ranks...")
+            print(f"  Load balance: min={rank_loads.min():.2e}, "
+                  f"max={rank_loads.max():.2e} (10^10 Msun/h)")
+
+        if args.subsample is not None:
+            np.random.seed(args.seed + rank)
+
+        my_halo_ids = []
+        my_positions = []
+        my_npart = []
+        my_rejected_monotonic = 0
+        n_my_halos = len(my_indices)
+        report_every = max(1, n_my_halos // 10)
+
+        my_centers = np.array(
+            [subhalo_pos[first_sub[g]] for g in my_indices])
+        my_radii = np.array([R200c[g] for g in my_indices])
+
+        for i, group_idx in enumerate(my_indices):
+            radius = my_radii[i]
+            pos = load_dm_particles_for_halo(
+                basepath, snap_num, group_idx,
+                my_centers[i], radius, box_size)
+
+            if len(pos) == 0:
+                print(f"  [Rank {rank}] Warning: No particles for "
+                      f"halo {group_idx}")
                 continue
 
-        # Subsample if requested
-        if args.subsample is not None and len(pos) > args.subsample:
-            idx = np.random.choice(len(pos), args.subsample, replace=False)
-            pos = pos[idx]
+            if args.check_monotonic:
+                if not check_decreasing_outer_profile(pos, radius):
+                    my_rejected_monotonic += 1
+                    continue
 
-        my_halo_ids.append(group_idx)
-        my_positions.append(pos)
-        my_npart.append(len(pos))
+            if args.subsample is not None and len(pos) > args.subsample:
+                idx = np.random.choice(
+                    len(pos), args.subsample, replace=False)
+                pos = pos[idx]
 
-        if (i + 1) % report_every == 0 or i == n_my_halos - 1:
-            print(f"  [Rank {rank}] Processed {i + 1}/{n_my_halos} halos")
+            my_halo_ids.append(group_idx)
+            my_positions.append(pos)
+            my_npart.append(len(pos))
 
-    # Gather all data to rank 0
-    all_halo_ids = comm.gather(my_halo_ids, root=0)
-    all_positions = comm.gather(my_positions, root=0)
-    all_npart = comm.gather(my_npart, root=0)
-    all_rejected_monotonic = comm.gather(my_rejected_monotonic, root=0)
+            if (i + 1) % report_every == 0 or i == n_my_halos - 1:
+                print(f"  [Rank {rank}] Processed "
+                      f"{i + 1}/{n_my_halos} halos")
 
+        # Gather all data to rank 0
+        all_halo_ids = comm.gather(my_halo_ids, root=0)
+        all_positions = comm.gather(my_positions, root=0)
+        all_npart = comm.gather(my_npart, root=0)
+        all_rejected_monotonic = comm.gather(my_rejected_monotonic, root=0)
+
+        if rank == 0:
+            total_rejected_monotonic = sum(all_rejected_monotonic)
+            if args.check_monotonic and total_rejected_monotonic > 0:
+                print(f"  Rejected {total_rejected_monotonic} halos "
+                      f"with non-monotonic outer profile")
+
+            halo_ids = []
+            positions = []
+            npart = []
+            for r in range(size):
+                halo_ids.extend(all_halo_ids[r])
+                positions.extend(all_positions[r])
+                npart.extend(all_npart[r])
+
+    # ---- Common output writing (rank 0 only) ----
     if rank == 0:
-        # Report monotonic rejections
-        total_rejected_monotonic = sum(all_rejected_monotonic)
-        if args.check_monotonic and total_rejected_monotonic > 0:
-            print(f"  Rejected {total_rejected_monotonic} halos with "
-                  f"non-monotonic outer profile")
-
-        # Flatten lists from all ranks
-        halo_ids = []
-        positions = []
-        npart = []
-        for r in range(size):
-            halo_ids.extend(all_halo_ids[r])
-            positions.extend(all_positions[r])
-            npart.extend(all_npart[r])
-
         if len(halo_ids) == 0:
             print("  Warning: No halos successfully extracted!")
             return
@@ -676,6 +965,11 @@ def main():
                         help="Random seed for subsampling (default: 42)")
     parser.add_argument("--check-monotonic", action="store_true",
                         help="Reject halos with non-monotonic outer profile")
+    parser.add_argument(
+        "--sphere-cut", action="store_true",
+        help="Load ALL particles within R200c (not just FoF members). "
+        "Loops through snapshot chunks to include particles from "
+        "all structures.")
     args = parser.parse_args()
 
     # Only rank 0 prints header and does selection
@@ -735,6 +1029,11 @@ def main():
         output_dir = data_dir / "tng_particles"
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"\nOutput directory: {output_dir}")
+        if args.sphere_cut:
+            print("  Mode: sphere cut (all particles within "
+                  "R200c, not just FoF)")
+        else:
+            print("  Mode: FoF halo particles")
         if args.subsample is not None:
             print(f"  Subsampling to {args.subsample} particles per halo "
                   f"(seed={args.seed})")
