@@ -39,6 +39,7 @@ typedef struct {
     SimpsonGrid grid;  /* Precomputed Simpson integration grid */
     DensityFunc rho;
     int nparams;
+    double min_density;  /* Minimum density threshold (underflow protection) */
 } ObjectiveData;
 
 /*
@@ -61,6 +62,7 @@ typedef struct {
  *   ftol           - Relative tolerance on function value
  *   maxeval        - Maximum function evaluations
  *   optimizer_type - Optimizer: OPT_NELDERMEAD, OPT_BOBYQA, or OPT_SBPLX
+ *   min_density    - Minimum density threshold (underflow protection)
  *   out_params     - Output: best-fit parameters in physical space
  *   out_loss       - Output: best-fit loss value
  *   out_converged  - Output: 1 if converged, 0 otherwise
@@ -71,7 +73,7 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
                  DensityFunc rho, int nparams, double* initial_params,
                  double* lower_bounds, double* upper_bounds,
                  double xtol, double ftol, int maxeval,
-                 int optimizer_type,
+                 int optimizer_type, double min_density,
                  double* out_params, double* out_loss,
                  int* out_converged, int* out_neval);
 

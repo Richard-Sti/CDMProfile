@@ -47,7 +47,7 @@ static double nlopt_objective(unsigned n, const double* x,
 
     return compute_loss(obj->bin_counts, obj->bin_positions, obj->nbin,
                         obj->npart, &obj->grid,
-                        obj->rho, Rs, a0, a1, a2, a3);
+                        obj->rho, Rs, a0, a1, a2, a3, obj->min_density);
 }
 
 
@@ -56,7 +56,7 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
                  DensityFunc rho, int nparams, double* initial_params,
                  double* lower_bounds, double* upper_bounds,
                  double xtol, double ftol, int maxeval,
-                 int optimizer_type,
+                 int optimizer_type, double min_density,
                  double* out_params, double* out_loss,
                  int* out_converged, int* out_neval) {
 
@@ -68,6 +68,7 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
     obj_data.npart = npart;
     obj_data.rho = rho;
     obj_data.nparams = nparams;
+    obj_data.min_density = min_density;
 
     /* Precompute Simpson grid once for entire optimization */
     simpson_grid_init(&obj_data.grid, rmin, rmax);
