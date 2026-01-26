@@ -3,7 +3,7 @@
 # Submit select_tng_halos.py to glamdring queue.
 #
 # Usage:
-#   ./select_tng_halos.sh <on_login> <nprocs> <snap> [--extract]
+#   ./select_tng_halos.sh <on_login> <nprocs> <snap> [--extract] [--sphere-cut]
 #
 
 memory=7
@@ -12,20 +12,32 @@ queue="berg"
 on_login=${1}
 nprocs=${2}
 snap=${3}
-extract_flag=${4}
+shift 3 2>/dev/null
+
+extract_flag=false
+sphere_cut_flag=false
+for arg in "$@"; do
+    case "$arg" in
+        --extract) extract_flag=true ;;
+        --sphere-cut) sphere_cut_flag=true ;;
+        *) echo "Unknown option: $arg"; exit 1 ;;
+    esac
+done
 
 if [ -z "$on_login" ] || [ -z "$nprocs" ] || [ -z "$snap" ]; then
-    echo "Usage: ./select_tng_halos.sh <on_login> <nprocs> <snap> [--extract]"
+    echo "Usage: ./select_tng_halos.sh <on_login> <nprocs> <snap> [--extract] [--sphere-cut]"
     echo ""
     echo "Arguments:"
-    echo "  on_login    1 to run locally, 0 to submit to queue"
-    echo "  nprocs      Number of MPI processes"
-    echo "  snap        Snapshot number (e.g., 99)"
-    echo "  --extract   Extract particles for selected halos (optional)"
+    echo "  on_login      1 to run locally, 0 to submit to queue"
+    echo "  nprocs        Number of MPI processes"
+    echo "  snap          Snapshot number (e.g., 99)"
+    echo "  --extract     Extract particles for selected halos (optional)"
+    echo "  --sphere-cut  Load ALL particles within R200c, not just FoF members (optional)"
     echo ""
     echo "Example:"
     echo "  ./select_tng_halos.sh 1 1 99"
     echo "  ./select_tng_halos.sh 0 16 99 --extract"
+    echo "  ./select_tng_halos.sh 0 16 99 --extract --sphere-cut"
     exit 1
 fi
 
@@ -65,8 +77,11 @@ pythoncm="$pythoncm --min-mass $min_mass --max-offset $max_offset"
 pythoncm="$pythoncm --max-satellite-ratio $max_satellite_ratio"
 pythoncm="$pythoncm --isolation-distance $isolation_distance"
 pythoncm="$pythoncm --isolation-mass-ratio $isolation_mass_ratio"
-if [ "$extract_flag" == "--extract" ]; then
+if [ "$extract_flag" == "true" ]; then
     pythoncm="$pythoncm --extract"
+fi
+if [ "$sphere_cut_flag" == "true" ]; then
+    pythoncm="$pythoncm --sphere-cut"
 fi
 if [ -n "$subsample" ]; then
     pythoncm="$pythoncm --subsample $subsample --seed $seed"
