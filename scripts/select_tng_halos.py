@@ -444,18 +444,21 @@ def sphere_cut_process_chunks(basepath, snap_num, chunk_ids, centers,
     results = [[] for _ in range(n_halos)]
     radii_sq = radii ** 2
     n_chunks = len(chunk_ids)
-    report_every = max(1, n_chunks // 10)
     particle_batch = 5_000_000
 
     for ci, chunk_id in enumerate(chunk_ids):
         chunk_path = snap_dir / f"snap_{snap_num:03d}.{chunk_id}.hdf5"
+        print(f"    [Rank {rank}] Starting chunk {ci + 1}/{n_chunks} "
+              f"(file {chunk_id})", flush=True)
         with h5py.File(chunk_path, 'r') as f:
             if 'PartType1' not in f:
                 continue
             dataset = f['PartType1']['Coordinates']
             n_particles = dataset.shape[0]
+            n_batches = (n_particles + particle_batch - 1) // particle_batch
 
-            for start in range(0, n_particles, particle_batch):
+            for bi, start in enumerate(
+                    range(0, n_particles, particle_batch)):
                 end = min(start + particle_batch, n_particles)
                 coords = dataset[start:end]
 
@@ -468,8 +471,8 @@ def sphere_cut_process_chunks(basepath, snap_num, chunk_ids, centers,
                     if mask.any():
                         results[i].append(delta[mask])
 
-        if (ci + 1) % report_every == 0:
-            print(f"    [Rank {rank}] Chunk {ci + 1}/{n_chunks}")
+                print(f"      [Rank {rank}] Batch {bi + 1}/{n_batches} "
+                      f"done", flush=True)
 
     # Write results to temporary HDF5
     counts = np.zeros(n_halos, dtype=np.int64)
@@ -601,7 +604,9 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
 
         if rank == 0:
             print(f"\nSphere cut: partitioning {n_files} chunks across "
-                  f"{size} ranks ({len(selected_indices)} halos)")
+                  f"{size} ranks ({len(selected_indices)} halos)",
+                  flush=True)
+        comm.Barrier()
 
         tmp_path = output_dir / f"_sphere_tmp_rank{rank}.hdf5"
         print(f"  [Rank {rank}] Processing {len(my_chunk_ids)} chunks...")
