@@ -241,14 +241,14 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                          int nparams, double* initial_params,
                          double* lower_bounds, double* upper_bounds,
                          double xtol, double ftol, int maxeval,
-                         int optimizer_type,
+                         int optimizer_type, double min_density,
                          double* out_params, double* out_loss,
                          int* out_converged, int* out_neval) {
     fit_profile(bin_counts, bin_positions, nbin, npart, rmin, rmax,
                 rho_func, nparams, initial_params,
                 lower_bounds, upper_bounds,
                 xtol, ftol, maxeval,
-                optimizer_type,
+                optimizer_type, min_density,
                 out_params, out_loss, out_converged, out_neval);
 }
 """
@@ -292,7 +292,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                              int nparams, double* initial_params,
                              double* lower_bounds, double* upper_bounds,
                              double xtol, double ftol, int maxeval,
-                             int optimizer_type,
+                             int optimizer_type, double min_density,
                              double* out_params, double* out_loss,
                              int* out_converged, int* out_neval);
     """
@@ -314,7 +314,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
     # Create Python wrapper
     def fit(bin_counts, bin_positions, rmin, rmax,
             initial_params=None, lower_bounds=None, upper_bounds=None,
-            xtol=1e-6, ftol=1e-6, maxeval=1000, optimizer='neldermead'):
+            xtol=1e-6, ftol=1e-6, maxeval=1000, optimizer='neldermead',
+            min_density=1e-100):
         """
         Fit density profile to binned data. Returns dict with loss, params,
         converged, neval.
@@ -361,7 +362,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
             ffi.cast("double*", lower_bounds.ctypes.data),
             ffi.cast("double*", upper_bounds.ctypes.data),
             xtol, ftol, maxeval,
-            optimizer_type,
+            optimizer_type, min_density,
             ffi.cast("double*", out_params.ctypes.data),
             ffi.cast("double*", out_loss.ctypes.data),
             ffi.cast("int*", out_converged.ctypes.data),
@@ -382,7 +383,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                           Rs_lower_factor=0.25, Rs_upper_factor=10.0,
                           a_lower=-500.0, a_upper=500.0,
                           xtol=1e-6, ftol=1e-6, maxeval=5000, seed=None,
-                          optimizer='sbplx'):
+                          optimizer='sbplx', min_density=1e-100):
         """
         Fit with multiple restarts using Latin Hypercube Sampling.
 
@@ -429,7 +430,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                          lower_bounds=lower_bounds,
                          upper_bounds=upper_bounds,
                          xtol=xtol, ftol=ftol, maxeval=maxeval,
-                         optimizer=optimizer)
+                         optimizer=optimizer, min_density=min_density)
 
             total_neval += result['neval']
 
@@ -489,6 +490,489 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
     fit.fit_with_restarts = fit_with_restarts
 
     return fit
+
+
+###############################################################################
+#                         Nested optimization                                 #
+###############################################################################
+
+
+def compile_nested_fitter(expr_str, parser=None, simpson_n=512):
+    """
+    JIT compile a nested fitter for global + local parameter optimization.
+
+    The nested optimizer fits multiple halos simultaneously, where some
+    parameters are shared (global) and others are per-halo (local).
+
+    Parameters
+    ----------
+    expr_str : str
+        Expression for the density profile (e.g., "1/(x*(1+x)**a0)").
+    parser : SympyParser, optional
+        Parser instance for expression parsing.
+    simpson_n : int, optional
+        Number of points for Simpson integration. Default: 512.
+
+    Returns
+    -------
+    NestedFitter
+        Object with fit() method for nested optimization.
+    """
+    if parser is None:
+        parser = SympyParser()
+
+    if simpson_n % 2 != 0:
+        raise ValueError(f"simpson_n must be even, got {simpson_n}")
+
+    # Parse expression and count parameters
+    expr = parser.parse(expr_str)
+    nfree = parser.count_free(expr)
+    nparams = 1 + nfree  # Rs + free parameters
+
+    # Generate C code for density function
+    expr_substituted = expr.subs(parser._x, parser._r / parser._Rs)
+    c_expr = ccode(expr_substituted)
+
+    # Read static C files
+    loss_h = _read_csrc('loss.h')
+    loss_c = _read_csrc('loss.c')
+    nested_h = _read_csrc('nested_optimizer.h')
+    nested_c = _read_csrc('nested_optimizer.c')
+
+    # Generate density function C code
+    rho_func_c = f"""
+/* Auto-generated density function */
+/* Expression: {expr_str} */
+static inline __attribute__((always_inline))
+double rho_func(double r, double Rs,
+                double a0, double a1, double a2, double a3) {{
+    (void)a0; (void)a1; (void)a2; (void)a3;
+    return {c_expr};
+}}
+"""
+
+    # Combine all C source
+    full_c_source = f"""
+#include <math.h>
+#include <float.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <nlopt.h>
+
+#define SIMPSON_N {simpson_n}
+
+/* ===== loss.h ===== */
+{loss_h}
+
+/* ===== nested_optimizer.h ===== */
+{nested_h}
+
+/* ===== Auto-generated rho_func ===== */
+{rho_func_c}
+
+/* ===== loss.c ===== */
+{loss_c}
+
+/* ===== nested_optimizer.c ===== */
+{nested_c}
+
+/* ===== Python interface wrapper ===== */
+void fit_nested_wrapper(
+    /* Halo data arrays (nhalos x nbin) */
+    double* all_bin_counts,
+    double* all_bin_positions,
+    int* all_nbin,
+    int* all_npart,
+    double* all_rmin,
+    double* all_rmax,
+    int nhalos,
+
+    /* Parameter configuration */
+    int nparams_total,
+    int* param_is_global,
+
+    /* Bounds */
+    double* lower_bounds,
+    double* upper_bounds,
+
+    /* Initial guesses */
+    double* initial_global,
+    double* initial_local,  /* nhalos x n_local, can be NULL */
+
+    /* Tolerances */
+    double xtol,
+    double ftol,
+    int inner_maxeval,
+    int outer_maxeval,
+
+    /* Inner restart settings */
+    int inner_max_restarts,
+    int inner_nconv_required,
+    double inner_conv_rtol,
+    double inner_conv_atol,
+
+    /* Outer restart settings */
+    int outer_max_restarts,
+    int outer_nconv_required,
+    double outer_conv_rtol,
+    double outer_conv_atol,
+
+    /* Parallelization */
+    int nthreads,
+
+    /* Numerical stability */
+    double min_density,
+
+    int verbose,
+
+    /* Outputs */
+    double* out_global_params,
+    double* out_local_params,   /* nhalos x n_local */
+    double* out_halo_losses,    /* nhalos */
+    double* out_total_loss,
+    int* out_converged,
+    int* out_outer_neval,
+    int* out_total_inner_neval
+) {{
+    /* Setup halo data array */
+    HaloData* halos = (HaloData*)malloc(nhalos * sizeof(HaloData));
+
+    int max_nbin = 0;
+    for (int h = 0; h < nhalos; h++) {{
+        if (all_nbin[h] > max_nbin) max_nbin = all_nbin[h];
+    }}
+
+    /* Point each halo to its slice of the data arrays */
+    for (int h = 0; h < nhalos; h++) {{
+        halos[h].bin_counts = &all_bin_counts[h * max_nbin];
+        halos[h].bin_positions = &all_bin_positions[h * max_nbin];
+        halos[h].nbin = all_nbin[h];
+        halos[h].npart = all_npart[h];
+        halos[h].rmin = all_rmin[h];
+        halos[h].rmax = all_rmax[h];
+    }}
+
+    /* Initialize config */
+    NestedOptConfig config;
+    nested_opt_init(&config, halos, nhalos, rho_func, nparams_total,
+                    param_is_global);
+    nested_opt_set_bounds(&config, lower_bounds, upper_bounds);
+    nested_opt_set_tolerances(&config, xtol, ftol,
+                              inner_maxeval, outer_maxeval);
+    nested_opt_set_inner_restarts(&config, inner_max_restarts,
+                                  inner_nconv_required,
+                                  inner_conv_rtol, inner_conv_atol);
+    nested_opt_set_outer_restarts(&config, outer_max_restarts,
+                                  outer_nconv_required,
+                                  outer_conv_rtol, outer_conv_atol);
+    config.nthreads = nthreads;
+    config.min_density = min_density;
+    config.verbose = verbose;
+
+    /* Run nested optimization */
+    NestedOptResult result;
+    fit_nested_profile(&config, initial_global, initial_local, &result);
+
+    /* Copy results */
+    for (int i = 0; i < config.n_global; i++) {{
+        out_global_params[i] = result.global_params[i];
+    }}
+
+    int n_local = config.n_local;
+    for (int h = 0; h < nhalos; h++) {{
+        for (int i = 0; i < n_local; i++) {{
+            int idx = h * n_local + i;
+            out_local_params[idx] = result.local_params[idx];
+        }}
+        out_halo_losses[h] = result.halo_losses[h];
+    }}
+
+    *out_total_loss = result.total_loss;
+    *out_converged = result.converged;
+    *out_outer_neval = result.outer_neval;
+    *out_total_inner_neval = result.total_inner_neval;
+
+    /* Cleanup */
+    nested_opt_result_free(&result);
+    free(halos);
+}}
+"""
+
+    # CFFI definitions
+    cdef = """
+    void fit_nested_wrapper(
+        double* all_bin_counts,
+        double* all_bin_positions,
+        int* all_nbin,
+        int* all_npart,
+        double* all_rmin,
+        double* all_rmax,
+        int nhalos,
+        int nparams_total,
+        int* param_is_global,
+        double* lower_bounds,
+        double* upper_bounds,
+        double* initial_global,
+        double* initial_local,
+        double xtol,
+        double ftol,
+        int inner_maxeval,
+        int outer_maxeval,
+        int inner_max_restarts,
+        int inner_nconv_required,
+        double inner_conv_rtol,
+        double inner_conv_atol,
+        int outer_max_restarts,
+        int outer_nconv_required,
+        double outer_conv_rtol,
+        double outer_conv_atol,
+        int nthreads,
+        double min_density,
+        int verbose,
+        double* out_global_params,
+        double* out_local_params,
+        double* out_halo_losses,
+        double* out_total_loss,
+        int* out_converged,
+        int* out_outer_neval,
+        int* out_total_inner_neval
+    );
+    """
+
+    # Compile
+    ffi = FFI()
+    ffi.cdef(cdef)
+
+    include_dirs, library_dirs = _get_nlopt_paths()
+
+    # OpenMP flags depend on platform
+    if sys.platform == "darwin":
+        # macOS with clang needs special flags and libomp paths
+        # libomp is keg-only, so we need explicit paths
+        omp_compile = ["-Xpreprocessor", "-fopenmp",
+                       "-I/opt/homebrew/opt/libomp/include"]
+        omp_link = ["-L/opt/homebrew/opt/libomp/lib", "-lomp"]
+    else:
+        # Linux with gcc
+        omp_compile = ["-fopenmp"]
+        omp_link = ["-fopenmp"]
+
+    lib = ffi.verify(
+        full_c_source,
+        libraries=["m", "nlopt"],
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+        extra_compile_args=["-O3", "-ffast-math", "-march=native"]
+        + omp_compile,
+        extra_link_args=omp_link,
+    )
+
+    class NestedFitter:
+        """Nested optimizer for global + local parameter fitting."""
+
+        def __init__(self):
+            self.expr_str = expr_str
+            self.nparams = nparams
+            self.nfree = nfree
+            self.simpson_n = simpson_n
+
+        def fit(self, binned_data, param_is_global,
+                Rs_lower_factor=0.25, Rs_upper_factor=10.0,
+                a_lower=-500.0, a_upper=500.0,
+                initial_global=None, initial_local=None,
+                xtol=1e-6, ftol=1e-6,
+                inner_maxeval=500, outer_maxeval=200,
+                inner_max_restarts=100, inner_nconv_required=10,
+                inner_conv_rtol=1e-3, inner_conv_atol=10.0,
+                outer_max_restarts=5, outer_nconv_required=2,
+                outer_conv_rtol=1e-3, outer_conv_atol=10.0,
+                nthreads=0, min_density=1e-100, verbose=False):
+            """
+            Fit multiple halos with global + local parameters.
+
+            Parameters
+            ----------
+            binned_data : dict
+                Output from HaloCollection.bin() with keys:
+                'bin_counts', 'bin_positions', 'rmin', 'rmax', 'npart'
+            param_is_global : list of bool
+                Length nparams. True if parameter is global (shared).
+                Index 0 = Rs, 1 = a0, 2 = a1, etc.
+            Rs_lower_factor : float
+                Lower bound for Rs = factor * min(rmin). Default: 0.25.
+            Rs_upper_factor : float
+                Upper bound for Rs = factor * max(rmax). Default: 10.0.
+            a_lower, a_upper : float
+                Bounds for free parameters a0, a1, etc. Default: [-500, 500].
+            initial_global : array-like, optional
+                Initial guess for global params.
+            initial_local : array-like, optional
+                Initial guess for local params (nhalos x n_local).
+            xtol, ftol : float
+                Optimization tolerances.
+            inner_maxeval, outer_maxeval : int
+                Max evaluations for inner/outer optimization.
+            inner_max_restarts : int
+                Max restarts per halo for inner optimization. Default: 100.
+            inner_nconv_required : int
+                Inner convergences to same minimum required. Default: 10.
+            inner_conv_rtol, inner_conv_atol : float
+                Inner convergence tolerances (atol + rtol * |loss|).
+            outer_max_restarts : int
+                Max restarts for outer optimization. Default: 5.
+            outer_nconv_required : int
+                Outer convergences to same minimum required. Default: 2.
+            outer_conv_rtol, outer_conv_atol : float
+                Outer convergence tolerances (atol + rtol * |loss|).
+            nthreads : int
+                Number of OpenMP threads for parallel halo fitting.
+                0 = use all available cores (default).
+            min_density : float
+                Minimum allowed density value (underflow protection).
+                Rejects parameter combinations that produce densities below
+                this threshold. Default: 1e-100.
+            verbose : bool
+                Print progress.
+
+            Returns
+            -------
+            dict with keys:
+                global_params : ndarray of global parameter values
+                local_params : ndarray (nhalos x n_local) of local params
+                halo_losses : ndarray of per-halo losses
+                total_loss : float
+                converged : bool
+                outer_neval : int
+                total_inner_neval : int
+            """
+            bin_counts = binned_data['bin_counts']
+            bin_positions = binned_data['bin_positions']
+            rmin = binned_data['rmin']
+            rmax = binned_data['rmax']
+            npart = binned_data['npart']
+
+            nhalos = len(bin_counts)
+            max_nbin = bin_counts.shape[1]
+
+            # Convert param_is_global to int array
+            param_is_global = np.asarray(param_is_global, dtype=np.int32)
+            if len(param_is_global) < 5:
+                param_is_global = np.pad(
+                    param_is_global, (0, 5 - len(param_is_global)))
+
+            n_global = int(param_is_global[:nparams].sum())
+            n_local = nparams - n_global
+
+            # Compute bounds same as fit_with_restarts
+            Rs_lower = Rs_lower_factor * rmin.min()
+            Rs_upper = Rs_upper_factor * rmax.max()
+            lower_bounds = np.array(
+                [Rs_lower, a_lower, a_lower, a_lower, a_lower],
+                dtype=np.float64)
+            upper_bounds = np.array(
+                [Rs_upper, a_upper, a_upper, a_upper, a_upper],
+                dtype=np.float64)
+
+            # Default initial global
+            if initial_global is None:
+                initial_global = np.zeros(n_global, dtype=np.float64)
+                # Set to midpoint of bounds for global params
+                g_idx = 0
+                for i in range(nparams):
+                    if param_is_global[i]:
+                        initial_global[g_idx] = 0.5 * (
+                            lower_bounds[i] + upper_bounds[i])
+                        g_idx += 1
+            else:
+                initial_global = np.ascontiguousarray(
+                    initial_global, dtype=np.float64)
+
+            # Prepare data arrays
+            all_bin_counts = np.ascontiguousarray(
+                bin_counts, dtype=np.float64)
+            all_bin_positions = np.ascontiguousarray(
+                bin_positions, dtype=np.float64)
+            all_nbin = np.ascontiguousarray(
+                [max_nbin] * nhalos, dtype=np.int32)
+            all_npart = np.ascontiguousarray(npart, dtype=np.int32)
+            all_rmin = np.ascontiguousarray(rmin, dtype=np.float64)
+            all_rmax = np.ascontiguousarray(rmax, dtype=np.float64)
+
+            # Prepare initial local (or NULL)
+            if initial_local is not None:
+                initial_local = np.ascontiguousarray(
+                    initial_local, dtype=np.float64)
+                initial_local_ptr = ffi.cast(
+                    "double*", initial_local.ctypes.data)
+            else:
+                initial_local_ptr = ffi.NULL
+
+            # Output arrays
+            out_global = np.zeros(n_global, dtype=np.float64)
+            out_local = np.zeros((nhalos, n_local), dtype=np.float64)
+            out_halo_losses = np.zeros(nhalos, dtype=np.float64)
+            out_total_loss = np.zeros(1, dtype=np.float64)
+            out_converged = np.zeros(1, dtype=np.int32)
+            out_outer_neval = np.zeros(1, dtype=np.int32)
+            out_total_inner_neval = np.zeros(1, dtype=np.int32)
+
+            # Call C function
+            lib.fit_nested_wrapper(
+                ffi.cast("double*", all_bin_counts.ctypes.data),
+                ffi.cast("double*", all_bin_positions.ctypes.data),
+                ffi.cast("int*", all_nbin.ctypes.data),
+                ffi.cast("int*", all_npart.ctypes.data),
+                ffi.cast("double*", all_rmin.ctypes.data),
+                ffi.cast("double*", all_rmax.ctypes.data),
+                nhalos,
+                nparams,
+                ffi.cast("int*", param_is_global.ctypes.data),
+                ffi.cast("double*", lower_bounds.ctypes.data),
+                ffi.cast("double*", upper_bounds.ctypes.data),
+                ffi.cast("double*", initial_global.ctypes.data),
+                initial_local_ptr,
+                xtol, ftol,
+                inner_maxeval, outer_maxeval,
+                inner_max_restarts, inner_nconv_required,
+                inner_conv_rtol, inner_conv_atol,
+                outer_max_restarts, outer_nconv_required,
+                outer_conv_rtol, outer_conv_atol,
+                nthreads,
+                min_density,
+                1 if verbose else 0,
+                ffi.cast("double*", out_global.ctypes.data),
+                ffi.cast("double*", out_local.ctypes.data),
+                ffi.cast("double*", out_halo_losses.ctypes.data),
+                ffi.cast("double*", out_total_loss.ctypes.data),
+                ffi.cast("int*", out_converged.ctypes.data),
+                ffi.cast("int*", out_outer_neval.ctypes.data),
+                ffi.cast("int*", out_total_inner_neval.ctypes.data),
+            )
+
+            # Build param names for output
+            global_param_names = []
+            local_param_names = []
+            param_names = ['Rs'] + [f'a{i}' for i in range(nfree)]
+            for i in range(nparams):
+                if param_is_global[i]:
+                    global_param_names.append(param_names[i])
+                else:
+                    local_param_names.append(param_names[i])
+
+            return {
+                'global_params': out_global,
+                'global_param_names': global_param_names,
+                'local_params': out_local,
+                'local_param_names': local_param_names,
+                'halo_losses': out_halo_losses,
+                'total_loss': out_total_loss[0],
+                'converged': bool(out_converged[0]),
+                'outer_neval': out_outer_neval[0],
+                'total_inner_neval': out_total_inner_neval[0],
+            }
+
+    return NestedFitter()
 
 
 ###############################################################################
