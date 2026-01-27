@@ -7,7 +7,7 @@ runname = "ext_maths_DM"
 
 # Path to halo data (folder of .npy files or HDF5 file)
 # Can be overridden with --halos command line argument
-halos = "tng_particles/particles_099.hdf5"
+halos = "tng_particles/particles_050.hdf5"
 
 # Binning
 nbin = 100
