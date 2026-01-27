@@ -609,12 +609,16 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
         all_radii_arr = np.array([R200c[g] for g in selected_indices])
 
         if rank == 0:
+            # Clean up any stale temp files from previous runs.
+            for old in output_dir.glob("_sphere_tmp_*.hdf5"):
+                old.unlink()
             print(f"\nSphere cut: partitioning {n_files} chunks across "
                   f"{size} ranks ({len(selected_indices)} halos)",
                   flush=True)
         comm.Barrier()
 
-        tmp_path = output_dir / f"_sphere_tmp_rank{rank}.hdf5"
+        tmp_name = f"_sphere_tmp_snap{snap_num:03d}_rank{rank}.hdf5"
+        tmp_path = output_dir / tmp_name
         print(f"  [Rank {rank}] Processing {len(my_chunk_ids)} chunks...")
         sphere_cut_process_chunks(
             basepath, snap_num, my_chunk_ids, all_centers, all_radii_arr,
@@ -633,8 +637,8 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
             tmp_counts = []
             tmp_offsets = []
             for r in range(size):
-                tmp_file = output_dir / f"_sphere_tmp_rank{r}.hdf5"
-                fh = h5py.File(tmp_file, 'r')
+                tmp_name = f"_sphere_tmp_snap{snap_num:03d}_rank{r}.hdf5"
+                fh = h5py.File(output_dir / tmp_name, 'r')
                 counts = fh['counts'][:]
                 file_offsets = np.zeros(n_halos + 1, dtype=np.int64)
                 file_offsets[1:] = np.cumsum(counts)
@@ -709,7 +713,8 @@ def extract_halo_particles_mpi(basepath, snap_num, groups, subhalos,
             # Close and clean up temp files
             for r in range(size):
                 tmp_handles[r].close()
-                (output_dir / f"_sphere_tmp_rank{r}.hdf5").unlink()
+                tmp_name = f"_sphere_tmp_snap{snap_num:03d}_rank{r}.hdf5"
+                (output_dir / tmp_name).unlink()
 
             if args.check_monotonic and rejected_monotonic > 0:
                 print(f"  Rejected {rejected_monotonic} halos with "
