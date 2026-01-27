@@ -14,28 +14,51 @@ SRC_RESULTS="/mnt/users/rstiskalek/CDMProfile/results"
 SRC_DATA="/mnt/extraspace/rstiskalek/CDMProfile/data"
 
 usage() {
-    echo "Usage: $0 [results|data]"
+    echo "Usage: $0 [results|data] [--delete]"
+    echo ""
+    echo "  --delete  Remove local files not present on remote"
     exit 1
 }
 
-# ---- parse argument ----
-if [[ $# -ne 1 ]]; then
+# ---- parse arguments ----
+if [[ $# -lt 1 ]] || [[ $# -gt 2 ]]; then
     usage
 fi
+
+target="$1"
+shift
+
+delete_flag=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --delete)
+            delete_flag="--delete"
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            usage
+            ;;
+    esac
+done
 
 echo "[INFO] Ensuring local destination exists: ${DEST_BASE}"
 mkdir -p "$DEST_BASE"
 
-case "$1" in
+if [ -n "$delete_flag" ]; then
+    echo "[WARN] --delete enabled: local files not on remote will be removed"
+fi
+
+case "$target" in
     results)
         echo "[INFO] Pulling 'results' from glamdring -> ${DEST_BASE}"
-        rsync -avh --progress -e "ssh -i $SSH_KEY" \
+        rsync -avh --progress $delete_flag -e "ssh -i $SSH_KEY" \
           "$SRC_USER@$SRC_HOST:$SRC_RESULTS" \
           "$DEST_BASE/"
         ;;
     data)
         echo "[INFO] Pulling 'data' from glamdring -> ${DEST_BASE}"
-        rsync -avh --progress -e "ssh -i $SSH_KEY" \
+        rsync -avh --progress $delete_flag -e "ssh -i $SSH_KEY" \
           "$SRC_USER@$SRC_HOST:$SRC_DATA" \
           "$DEST_BASE/"
         ;;
