@@ -10,6 +10,12 @@
 #   --snaps    33,50,99
 #   --comps    1,2,3,4,5,6,7
 #
+# Status key:
+#   done    Result HDF5 exists
+#   <jobid> Job in progress (job ID from .out file)
+#   run..   Job in progress (no matching .out file found)
+#   -       Not started
+#
 
 # Defaults
 runname="ext_maths_DM"
@@ -35,7 +41,8 @@ if [ ! -f "$local_config" ]; then
     exit 1
 fi
 
-results=$(grep "results" "$local_config" | sed 's/.*= *"//' | sed 's/".*//')
+results=$(grep "results" "$local_config" \
+    | sed 's/.*= *"//' | sed 's/".*//')
 if [ -z "$results" ]; then
     echo "Error: results path not found in $local_config"
     exit 1
@@ -44,16 +51,35 @@ fi
 IFS=',' read -ra snap_list <<< "$snaps"
 IFS=',' read -ra comp_list <<< "$comps"
 
+# Build job ID lookup file from python-*.out files.
+# Each line: <output_basename> <jobid>
+lookup=$(mktemp)
+for outfile in "$script_dir"/python-*.out; do
+    [ -f "$outfile" ] || continue
+    base=$(basename "$outfile")
+    jobid="${base#python-}"
+    jobid="${jobid%.out}"
+    out_line=$(grep "^Output:" "$outfile" 2>/dev/null \
+        | head -1)
+    if [ -n "$out_line" ]; then
+        out_fname=$(basename "${out_line#Output: }")
+        echo "$out_fname $jobid" >> "$lookup"
+    fi
+done
+
+# Column width
+w=10
+
 # Header
 printf "%-6s" ""
 for comp in "${comp_list[@]}"; do
-    printf "  %-6s" "c$comp"
+    printf "  %-${w}s" "c$comp"
 done
 echo ""
 
 printf "%-6s" ""
 for comp in "${comp_list[@]}"; do
-    printf "  %-6s" "------"
+    printf "  %-${w}s" "----------"
 done
 echo ""
 
@@ -64,17 +90,26 @@ for snap in "${snap_list[@]}"; do
     printf "s%-5s" "$snap_pad"
 
     for comp in "${comp_list[@]}"; do
-        result="$results/fit_${runname}_compl${comp}_${halos_name}.hdf5"
+        fname="fit_${runname}_compl${comp}_${halos_name}.hdf5"
+        result="$results/$fname"
         tmpdir="$results/tmp_fit_${runname}_compl${comp}_${halos_name}"
         cache="$results/cffi_cache_${runname}_compl${comp}_${halos_name}"
 
         if [ -f "$result" ]; then
-            printf "  %-6s" "done"
+            printf "  %-${w}s" "done"
         elif [ -d "$tmpdir" ] || [ -d "$cache" ]; then
-            printf "  %-6s" "run.."
+            jid=$(grep "^$fname " "$lookup" \
+                | tail -1 | awk '{print $2}')
+            if [ -n "$jid" ]; then
+                printf "  %-${w}s" "$jid"
+            else
+                printf "  %-${w}s" "run.."
+            fi
         else
-            printf "  %-6s" "-"
+            printf "  %-${w}s" "-"
         fi
     done
     echo ""
 done
+
+rm -f "$lookup"
