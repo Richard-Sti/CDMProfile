@@ -8,7 +8,8 @@
 # Arguments:
 #   on_login   : 1 to run locally, 0 to submit to queue
 #   nprocs     : Number of MPI processes
-#   complexity : Equation complexity level
+#   complexity : Equation complexity level, or comma-separated list
+#                (e.g. 3 or 3,4,5). Each level is a separate job.
 #   --snap     : Optional snapshot number (default: 99)
 #   --halos    : Optional path to halo data (overrides config.toml)
 #   --queue    : Optional queue/node name (default: berg)
@@ -59,7 +60,8 @@ if [ -z "$on_login" ] || [ -z "$nprocs" ] || [ -z "$complexity" ]; then
     echo "Arguments:"
     echo "  on_login    1 to run locally, 0 to submit to queue (required)"
     echo "  nprocs      Number of MPI processes (required)"
-    echo "  complexity  Equation complexity level (required)"
+    echo "  complexity  Equation complexity level or comma-separated list (required)"
+    echo "              A separate job is submitted for each level."
     echo "  --snap      Snapshot number (optional, default: 99)"
     echo "  --halos     Path to halo data (optional, overrides config.toml + --snap)"
     echo "  --queue     Queue/node name (optional, default: berg)"
@@ -67,6 +69,7 @@ if [ -z "$on_login" ] || [ -z "$nprocs" ] || [ -z "$complexity" ]; then
     echo ""
     echo "Example:"
     echo "  ./fit_functions.sh 1 4 3"
+    echo "  ./fit_functions.sh 0 32 3,4,5,6,7"
     echo "  ./fit_functions.sh 1 1 3 --snap 99"
     echo "  ./fit_functions.sh 0 32 5 --snap 50 --queue jaffe"
     echo "  ./fit_functions.sh 0 32 5 --resume"
@@ -101,24 +104,29 @@ fi
 
 env="$venv/bin/python"
 
-pythoncm="$env $file --complexity $complexity --snap $snap"
-if [ -n "$halos" ]; then
-    pythoncm="$pythoncm --halos $halos"
-fi
-if [ -n "$resume_flag" ]; then
-    pythoncm="$pythoncm --resume"
-fi
+# Split complexity on commas and submit one job per level.
+IFS=',' read -ra comp_list <<< "$complexity"
 
-if [ "$on_login" -eq 1 ]; then
-    cm="mpirun -n $nprocs $pythoncm"
-    echo "Running locally:"
-    echo $cm
-    echo
-    eval $cm
-else
-    cm="addqueue -q $queue -n $nprocs -m $memory $pythoncm"
-    echo "Submitting:"
-    echo $cm
-    echo
-    eval $cm
-fi
+for comp in "${comp_list[@]}"; do
+    pythoncm="$env $file --complexity $comp --snap $snap"
+    if [ -n "$halos" ]; then
+        pythoncm="$pythoncm --halos $halos"
+    fi
+    if [ -n "$resume_flag" ]; then
+        pythoncm="$pythoncm --resume"
+    fi
+
+    if [ "$on_login" -eq 1 ]; then
+        cm="mpirun -n $nprocs $pythoncm"
+        echo "Running locally:"
+        echo $cm
+        echo
+        eval $cm
+    else
+        cm="addqueue -q $queue -n $nprocs -m $memory $pythoncm"
+        echo "Submitting:"
+        echo $cm
+        echo
+        eval $cm
+    fi
+done
