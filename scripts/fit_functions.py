@@ -18,23 +18,20 @@ MPI script for fitting density profiles to halo data.
 Uses dynamic work distribution (master-worker pattern) where rank 0
 distributes batches of functions to worker ranks.
 """
+import shutil
 import warnings
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
 from time import time
 
-import numpy as np
+import cdmprof
 import h5py
+import numpy as np
 from mpi4py import MPI
 
-import cdmprof
-from utils import (
-    compute_function_scores,
-    print_best_results,
-    print_failed_functions,
-    read_config,
-)
+from utils import (compute_function_scores, print_best_results,
+                   print_failed_functions, read_config)
 
 # MPI tags
 WORK_TAG = 1
@@ -1584,3 +1581,7 @@ if __name__ == "__main__":
                       f"{format_time(total_cpu):>10}", flush=True)
                 print(f"  Wall time: {format_time(total_mpi_time)}",
                       flush=True)
+
+    # Clean up per-job CFFI cache directory
+    if rank == 0 and cffi_cache.exists():
+        shutil.rmtree(cffi_cache)
