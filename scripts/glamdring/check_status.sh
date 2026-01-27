@@ -59,8 +59,8 @@ for outfile in "$script_dir"/python-*.out; do
     base=$(basename "$outfile")
     jobid="${base#python-}"
     jobid="${jobid%.out}"
-    out_line=$(grep "^Output:" "$outfile" 2>/dev/null \
-        | head -1)
+    out_line=$(head -50 "$outfile" 2>/dev/null \
+        | grep "^Output:" | head -1)
     if [ -n "$out_line" ]; then
         out_fname=$(basename "${out_line#Output: }")
         echo "$out_fname $jobid" >> "$lookup"
