@@ -153,6 +153,104 @@ def load_all(particle_file, results_dir, result_pattern, complexities):
     }
 
 
+def load_all_multi(particle_files, results_dir, result_patterns,
+                    complexities):
+    """
+    Load and concatenate halos from multiple particle/result file pairs.
+
+    Parameters
+    ----------
+    particle_files : list of str or Path
+        HDF5 files with M200c, R200c, halo_id, offsets.
+    results_dir : str or Path
+        Directory containing result HDF5 files.
+    result_patterns : list of str
+        Filename patterns with ``{comp}`` placeholder, parallel to
+        `particle_files`.
+    complexities : list of int
+        Complexity levels to load.
+
+    Returns
+    -------
+    dict
+        Same structure as :func:`load_all`, with data concatenated across
+        all particle files and halo indices offset accordingly.
+    """
+    if len(particle_files) != len(result_patterns):
+        raise ValueError(
+            f"particle_files ({len(particle_files)}) and result_patterns "
+            f"({len(result_patterns)}) must have the same length.")
+
+    parts = [load_all(pf, results_dir, rp, complexities)
+             for pf, rp in zip(particle_files, result_patterns)]
+
+    # --- Verify equations are identical across all files ---
+    ref_eqs = parts[0]["equations"]
+    for i, p in enumerate(parts[1:], 1):
+        if p["equations"] != ref_eqs:
+            raise RuntimeError(
+                f"Equations from file {i} differ from file 0. All files "
+                "must use the same symbolic regression library.")
+
+    # --- Concatenate halo metadata ---
+    M200c = np.concatenate([p["M200c"] for p in parts])
+    R200c = np.concatenate([p["R200c"] for p in parts])
+    halo_ids = np.concatenate([p["halo_ids"] for p in parts])
+    npart_per_halo = np.concatenate([p["npart_per_halo"] for p in parts])
+    n_halos = sum(p["n_halos"] for p in parts)
+
+    # --- Concatenate result arrays, offsetting halo_idx ---
+    comp_arr = np.concatenate([p["comp"] for p in parts])
+    func_idx = np.concatenate([p["func_idx"] for p in parts])
+    loss = np.concatenate([p["loss"] for p in parts])
+    nparams = np.concatenate([p["nparams"] for p in parts])
+
+    halo_offset = 0
+    halo_idx_parts = []
+    for p in parts:
+        halo_idx_parts.append(p["halo_idx"] + halo_offset)
+        halo_offset += p["n_halos"]
+    halo_idx = np.concatenate(halo_idx_parts)
+
+    # --- Recompute derived arrays ---
+    npart_result = npart_per_halo[halo_idx]
+    ce = loss / npart_result
+    bic = nparams * np.log(npart_result) + 2 * loss
+
+    max_fidx = int(func_idx.max()) + 1 if len(func_idx) > 0 else 1
+    global_fid = comp_arr.astype(np.int64) * max_fidx + func_idx
+
+    # --- Merge nfw_scores (average across files) ---
+    nfw_scores = {}
+    for comp in ref_eqs:
+        vals = [p["nfw_scores"][comp] for p in parts
+                if p["nfw_scores"].get(comp) is not None]
+        nfw_scores[comp] = float(np.mean(vals)) if vals else None
+
+    print(f"\nCombined: {n_halos} halos from {len(parts)} files")
+
+    return {
+        "M200c": M200c,
+        "R200c": R200c,
+        "halo_ids": halo_ids,
+        "npart_per_halo": npart_per_halo,
+        "n_halos": n_halos,
+        "units_M200c": parts[0]["units_M200c"],
+        "comp": comp_arr,
+        "func_idx": func_idx,
+        "halo_idx": halo_idx,
+        "loss": loss,
+        "nparams": nparams,
+        "ce": ce,
+        "bic": bic,
+        "global_fid": global_fid,
+        "_max_fidx": max_fidx,
+        "equations": ref_eqs,
+        "nfw_scores": nfw_scores,
+        "complexities": sorted(ref_eqs.keys()),
+    }
+
+
 ###############################################################################
 #                             Scoring                                         #
 ###############################################################################
