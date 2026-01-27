@@ -1073,6 +1073,15 @@ if __name__ == "__main__":
     temp_dir_name = f"tmp_fit_{runname}_compl{args.complexity}_{halos_name}"
     temp_dir = results_base / temp_dir_name
 
+    # Per-job CFFI cache directory to avoid .so collisions between
+    # concurrent jobs (different complexity levels or snapshots).
+    cffi_cache_name = (f"cffi_cache_{runname}"
+                       f"_compl{args.complexity}_{halos_name}")
+    cffi_cache = results_base / cffi_cache_name
+    cffi_cache.mkdir(parents=True, exist_ok=True)
+    cdmprof.fitting.CFFI_TMPDIR = cffi_cache
+    cdmprof.symbolic.CFFI_TMPDIR = cffi_cache
+
     # Load equations (all ranks)
     equations = cdmprof.fitting.load_equations(equations_path)
 

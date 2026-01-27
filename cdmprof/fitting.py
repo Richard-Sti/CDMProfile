@@ -29,6 +29,11 @@ from .symbolic import SympyParser
 # Path to C source files
 CSRC_DIR = Path(__file__).parent / "csrc"
 
+# Optional per-job CFFI cache directory. Set this to a unique path before
+# calling compile_fitter() to avoid .so file collisions between concurrent
+# jobs. None uses CFFI's default (__pycache__ of this module).
+CFFI_TMPDIR = None
+
 # Constants for is_bad_function
 _BAD_PREFIXES = ("0", "zoo", "<class")
 _BAD_SUBSTRINGS = ("oo", "nan", "NaN")
@@ -303,13 +308,15 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
 
     include_dirs, library_dirs = _get_nlopt_paths()
 
-    lib = ffi.verify(
-        full_c_source,
+    verify_kwargs = dict(
         libraries=["m", "nlopt"],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         extra_compile_args=["-O3", "-ffast-math", "-march=native"],
     )
+    if CFFI_TMPDIR is not None:
+        verify_kwargs["tmpdir"] = str(CFFI_TMPDIR)
+    lib = ffi.verify(full_c_source, **verify_kwargs)
 
     # Create Python wrapper
     def fit(bin_counts, bin_positions, rmin, rmax,
@@ -758,8 +765,7 @@ void fit_nested_wrapper(
         omp_compile = ["-fopenmp"]
         omp_link = ["-fopenmp"]
 
-    lib = ffi.verify(
-        full_c_source,
+    verify_kwargs = dict(
         libraries=["m", "nlopt"],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
@@ -767,6 +773,9 @@ void fit_nested_wrapper(
         + omp_compile,
         extra_link_args=omp_link,
     )
+    if CFFI_TMPDIR is not None:
+        verify_kwargs["tmpdir"] = str(CFFI_TMPDIR)
+    lib = ffi.verify(full_c_source, **verify_kwargs)
 
     class NestedFitter:
         """Nested optimizer for global + local parameter fitting."""

@@ -20,6 +20,9 @@ from cffi import FFI
 from sympy import (Abs, Lambda, Pow, Symbol, ccode, lambdify, log, sqrt,
                    symbols, sympify)
 
+# Optional per-job CFFI cache directory (mirrors fitting.CFFI_TMPDIR).
+CFFI_TMPDIR = None
+
 
 class SympyParser:
     """
@@ -254,10 +257,10 @@ class SympyParser:
         # Compile with cffi
         ffi = FFI()
         ffi.cdef(f"{sig};")
-        lib = ffi.verify(
-            c_source,
-            libraries=["m"],  # Link math library
-        )
+        verify_kwargs = dict(libraries=["m"])
+        if CFFI_TMPDIR is not None:
+            verify_kwargs["tmpdir"] = str(CFFI_TMPDIR)
+        lib = ffi.verify(c_source, **verify_kwargs)
 
         c_func = getattr(lib, function_name)
 
