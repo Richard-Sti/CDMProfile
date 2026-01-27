@@ -1584,4 +1584,7 @@ if __name__ == "__main__":
 
     # Clean up per-job CFFI cache directory
     if rank == 0 and cffi_cache.exists():
-        shutil.rmtree(cffi_cache)
+        try:
+            shutil.rmtree(cffi_cache)
+        except OSError:
+            pass  # NFS may lag; harmless leftover

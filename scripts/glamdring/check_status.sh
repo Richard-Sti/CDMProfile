@@ -53,9 +53,10 @@ IFS=',' read -ra comp_list <<< "$comps"
 
 # Build job ID lookup file from python-*.out files.
 # Each line: <output_basename> <jobid>
+# Sorted by job ID ascending so tail -1 picks the latest.
 lookup=$(mktemp)
-for outfile in "$script_dir"/python-*.out; do
-    [ -f "$outfile" ] || continue
+for outfile in $(ls "$script_dir"/python-*.out 2>/dev/null \
+    | sort -t- -k2 -n); do
     base=$(basename "$outfile")
     jobid="${base#python-}"
     jobid="${jobid%.out}"
