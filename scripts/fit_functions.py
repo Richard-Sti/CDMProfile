@@ -44,6 +44,11 @@ DONE_TAG = 0
 MAX_NPARAMS = 10
 
 
+def _timestamp():
+    """Return current time as ``[HH:MM:SS]`` string."""
+    return datetime.now().strftime("[%H:%M:%S]")
+
+
 def format_time(seconds):
     """Format time in appropriate units (s, min, or h)."""
     if seconds >= 3600:
@@ -495,8 +500,8 @@ def fit_function_to_halos(func_idx, fitter, binned, fit_config,
                     break
 
         except Exception as e:
-            print(f"{log_prefix}func {func_idx}, halo {halo_idx} "
-                  f"failed: {e}", flush=True)
+            print(f"{_timestamp()} {log_prefix}func {func_idx}, "
+                  f"halo {halo_idx} failed: {e}", flush=True)
             # Track consecutive failures for early stopping
             if len(func_results) == 0:
                 n_consecutive_failures += 1
@@ -856,8 +861,7 @@ def master_loop(comm, job_queue, batch_size):
     n_total = len(job_queue)
     workers_done = 0
 
-    now = datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] Master: {n_total} functions to process, "
+    print(f"{_timestamp()} Master: {n_total} functions to process, "
           f"{n_workers} workers, batch size {batch_size}", flush=True)
 
     while workers_done < n_workers:
@@ -866,20 +870,19 @@ def master_loop(comm, job_queue, batch_size):
         worker_rank = comm.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG,
                                 status=status)
 
-        now = datetime.now().strftime("%H:%M:%S")
         if len(job_queue) > 0:
             # Send next batch
             batch = job_queue[:batch_size]
             job_queue = job_queue[batch_size:]
             comm.send(batch, dest=worker_rank, tag=WORK_TAG)
-            print(f"[{now}] Master: sent {len(batch)} jobs to "
+            print(f"{_timestamp()} Master: sent {len(batch)} jobs to "
                   f"rank {worker_rank}, {len(job_queue)} remaining",
                   flush=True)
         else:
             # No more work, tell worker to finish
             comm.send(None, dest=worker_rank, tag=DONE_TAG)
             workers_done += 1
-            print(f"[{now}] Master: rank {worker_rank} done, "
+            print(f"{_timestamp()} Master: rank {worker_rank} done, "
                   f"{n_workers - workers_done} workers remaining", flush=True)
 
 
@@ -951,20 +954,22 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
             try:
                 fitter = cdmprof.compile_fitter(expr_str)
             except Exception as e:
-                print(f"Rank {rank}: failed to compile func {func_idx} "
-                      f"'{expr_str}': {e}", flush=True)
+                print(f"{_timestamp()} Rank {rank}: failed to compile "
+                      f"func {func_idx} '{expr_str}': {e}", flush=True)
                 continue
 
             # Fit to all halos
             t_fit_start = time()
             fit_result = fit_function_to_halos(
                 func_idx, fitter, binned, fit_config,
-                nfw_config, nfw_per_halo, log_prefix=f"Rank {rank}: ")
+                nfw_config, nfw_per_halo,
+                log_prefix=f"Rank {rank}: ")
             total_fit_time += time() - t_fit_start
 
             # Handle early stopping
             if fit_result['early_stopped']:
-                print(f"Rank {rank}: func {func_idx} early stopped after "
+                print(f"{_timestamp()} Rank {rank}: func {func_idx} "
+                      f"early stopped after "
                       f"{early_stop_threshold} failures", flush=True)
                 continue
 
@@ -972,8 +977,8 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
                 n_fitted = len(fit_result['results'])
                 func_avg = np.mean([r[2] / np.sum(binned['bin_counts'][r[1]])
                                     for r in fit_result['results']])
-                print(f"Rank {rank}: NFW early stopped '{expr_str}' "
-                      f"(n={n_fitted}, avg={func_avg:.4f}, "
+                print(f"{_timestamp()} Rank {rank}: NFW early stopped "
+                      f"'{expr_str}' (n={n_fitted}, avg={func_avg:.4f}, "
                       f"nfw={fit_result['nfw_avg']:.4f})", flush=True)
                 continue
 
@@ -983,11 +988,13 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
             if n_success == 0:
                 if fit_result['n_negative_loss'] > 0:
                     negative_loss_func_idx.add(func_idx)
-                    print(f"Rank {rank}: func {func_idx} rejected "
-                          f"(negative loss) '{expr_str}'", flush=True)
+                    print(f"{_timestamp()} Rank {rank}: func {func_idx}"
+                          f" rejected (negative loss) '{expr_str}'",
+                          flush=True)
                 else:
-                    print(f"Rank {rank}: all fits failed for func {func_idx} "
-                          f"'{expr_str}'", flush=True)
+                    print(f"{_timestamp()} Rank {rank}: all fits failed"
+                          f" for func {func_idx} '{expr_str}'",
+                          flush=True)
                 continue
 
             results_buffer.extend(fit_result['results'])
@@ -1005,13 +1012,14 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
             total_results_written += len(results_buffer)
             results_buffer = []  # Clear buffer after writing
 
-        print(f"Rank {rank}: {n_funcs_batch} funcs in {batch_time:.1f}s | "
+        print(f"{_timestamp()} Rank {rank}: "
+              f"{n_funcs_batch} funcs in {batch_time:.1f}s | "
               f"{avg_per_func:.1f}s/func | {total_results_written} total",
               flush=True)
 
     total_worker_time = time() - t_worker_start
-    print(f"Rank {rank}: finished with {total_results_written} total results",
-          flush=True)
+    print(f"{_timestamp()} Rank {rank}: finished with "
+          f"{total_results_written} total results", flush=True)
 
     # Return timing data for aggregation
     return total_fit_time, total_worker_time
