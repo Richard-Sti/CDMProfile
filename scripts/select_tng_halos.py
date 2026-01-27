@@ -414,11 +414,14 @@ def sphere_cut_process_chunks(basepath, snap_num, chunk_ids, centers,
                               radii, box_size, output_path, rank):
     """
     Process assigned snapshot chunks, finding DM particles within each
-    halo's radius. Write results to a temporary HDF5 file.
+    halo's radius using a periodic cKDTree. Write results to a temporary
+    HDF5 file.
 
-    Each chunk is read once. For each chunk, all halos are checked.
-    Results are written as concatenated positions ordered by halo index,
-    with a counts array to reconstruct per-halo data.
+    Each chunk is read in batches. For each batch, a cKDTree is built
+    with periodic boundary conditions and all halos are queried
+    simultaneously via ``query_ball_point``. Results are written as
+    concatenated positions ordered by halo index, with a counts array
+    to reconstruct per-halo data.
 
     Parameters
     ----------
@@ -442,7 +445,6 @@ def sphere_cut_process_chunks(basepath, snap_num, chunk_ids, centers,
     snap_dir = Path(basepath) / f"snapdir_{snap_num:03d}"
     n_halos = len(centers)
     results = [[] for _ in range(n_halos)]
-    radii_sq = radii ** 2
     n_chunks = len(chunk_ids)
     particle_batch = 5_000_000
 
@@ -462,17 +464,21 @@ def sphere_cut_process_chunks(basepath, snap_num, chunk_ids, centers,
                 end = min(start + particle_batch, n_particles)
                 coords = dataset[start:end]
 
-                for i in range(n_halos):
-                    delta = coords - centers[i]
-                    delta -= box_size * np.round(delta / box_size)
-                    dist_sq = np.sum(delta**2, axis=1)
-                    mask = dist_sq < radii_sq[i]
+                tree = cKDTree(coords, boxsize=box_size)
+                indices_per_halo = tree.query_ball_point(centers, radii)
 
-                    if mask.any():
-                        results[i].append(delta[mask])
+                for i in range(n_halos):
+                    idx = indices_per_halo[i]
+                    if len(idx) > 0:
+                        delta = coords[idx] - centers[i]
+                        delta -= box_size * np.round(delta / box_size)
+                        results[i].append(delta)
 
                 print(f"      [Rank {rank}] Batch {bi + 1}/{n_batches} "
                       f"done", flush=True)
+
+        print(f"    [Rank {rank}] Chunk {ci + 1}/{n_chunks} done "
+              f"({n_particles} particles)", flush=True)
 
     # Write results to temporary HDF5
     counts = np.zeros(n_halos, dtype=np.int64)
