@@ -1025,6 +1025,8 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Fit density profiles with MPI")
     parser.add_argument("--complexity", type=int, required=True,
                         help="Equation complexity level")
+    parser.add_argument("--snap", type=int, default=99,
+                        help="Snapshot number (default: 99)")
     parser.add_argument("--halos", type=str, default=None,
                         help="Path to halo data (overrides config)")
     parser.add_argument("--resume", action="store_true",
@@ -1039,6 +1041,8 @@ if __name__ == "__main__":
         if halos_input is None:
             raise ValueError("No halos path specified. Use --halos or set "
                              "fitting.halos in config.toml")
+        # Format snapshot placeholder if present
+        halos_input = halos_input.format(snap=args.snap)
         # Resolve relative to data directory from local_config
         data_dir = Path(config['path'].get('data', '.'))
         halos_input = str(data_dir / halos_input)

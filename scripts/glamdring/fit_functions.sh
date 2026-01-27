@@ -3,12 +3,13 @@
 # Submit fit_functions.py to glamdring queue.
 #
 # Usage:
-#   ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--queue <name>] [--resume]
+#   ./fit_functions.sh <on_login> <nprocs> <complexity> [--snap <num>] [--halos <path>] [--queue <name>] [--resume]
 #
 # Arguments:
 #   on_login   : 1 to run locally, 0 to submit to queue
 #   nprocs     : Number of MPI processes
 #   complexity : Equation complexity level
+#   --snap     : Optional snapshot number (default: 99)
 #   --halos    : Optional path to halo data (overrides config.toml)
 #   --queue    : Optional queue/node name (default: berg)
 #   --resume   : Optional flag to resume from existing results
@@ -22,11 +23,16 @@ complexity=${3}
 shift 3
 
 # Parse optional arguments
+snap="99"
 halos=""
 queue="berg"
 resume_flag=""
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --snap)
+            snap="$2"
+            shift 2
+            ;;
         --halos)
             halos="$2"
             shift 2
@@ -48,19 +54,21 @@ done
 
 # Check required arguments
 if [ -z "$on_login" ] || [ -z "$nprocs" ] || [ -z "$complexity" ]; then
-    echo "Usage: ./fit_functions.sh <on_login> <nprocs> <complexity> [--halos <path>] [--queue <name>] [--resume]"
+    echo "Usage: ./fit_functions.sh <on_login> <nprocs> <complexity> [--snap <num>] [--halos <path>] [--queue <name>] [--resume]"
     echo ""
     echo "Arguments:"
     echo "  on_login    1 to run locally, 0 to submit to queue (required)"
     echo "  nprocs      Number of MPI processes (required)"
     echo "  complexity  Equation complexity level (required)"
-    echo "  --halos     Path to halo data (optional, uses config.toml if not specified)"
+    echo "  --snap      Snapshot number (optional, default: 99)"
+    echo "  --halos     Path to halo data (optional, overrides config.toml + --snap)"
     echo "  --queue     Queue/node name (optional, default: berg)"
     echo "  --resume    Resume from existing results (optional)"
     echo ""
     echo "Example:"
     echo "  ./fit_functions.sh 1 4 3"
-    echo "  ./fit_functions.sh 0 32 5 --queue jaffe"
+    echo "  ./fit_functions.sh 1 1 3 --snap 99"
+    echo "  ./fit_functions.sh 0 32 5 --snap 50 --queue jaffe"
     echo "  ./fit_functions.sh 0 32 5 --resume"
     exit 1
 fi
@@ -93,7 +101,7 @@ fi
 
 env="$venv/bin/python"
 
-pythoncm="$env $file --complexity $complexity"
+pythoncm="$env $file --complexity $complexity --snap $snap"
 if [ -n "$halos" ]; then
     pythoncm="$pythoncm --halos $halos"
 fi

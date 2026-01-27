@@ -6,8 +6,9 @@
 runname = "ext_maths_DM"
 
 # Path to halo data (folder of .npy files or HDF5 file)
-# Can be overridden with --halos command line argument
-halos = "tng_particles/particles_050.hdf5"
+# Use {snap:03d} as placeholder for the snapshot number (set via --snap)
+# Can be overridden entirely with --halos command line argument
+halos = "tng_particles/particles_{snap:03d}.hdf5"
 
 # Binning
 nbin = 100
