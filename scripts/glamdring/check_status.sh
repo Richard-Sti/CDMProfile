@@ -68,7 +68,7 @@ for outfile in "$script_dir"/python-*.out; do
 done
 
 # Column width
-w=10
+w=13
 
 # Header
 printf "%-6s" ""
@@ -79,7 +79,7 @@ echo ""
 
 printf "%-6s" ""
 for comp in "${comp_list[@]}"; do
-    printf "  %-${w}s" "----------"
+    printf "  %-${w}s" "-------------"
 done
 echo ""
 
@@ -95,13 +95,19 @@ for snap in "${snap_list[@]}"; do
         tmpdir="$results/tmp_fit_${runname}_compl${comp}_${halos_name}"
         cache="$results/cffi_cache_${runname}_compl${comp}_${halos_name}"
 
+        # Look up job ID
+        jid=$(grep "^$fname " "$lookup" \
+            | tail -1 | awk '{print $2}')
+
         if [ -f "$result" ]; then
-            printf "  %-${w}s" "done"
-        elif [ -d "$tmpdir" ] || [ -d "$cache" ]; then
-            jid=$(grep "^$fname " "$lookup" \
-                | tail -1 | awk '{print $2}')
             if [ -n "$jid" ]; then
-                printf "  %-${w}s" "$jid"
+                printf "  %-${w}s" "$jid done"
+            else
+                printf "  %-${w}s" "done"
+            fi
+        elif [ -d "$tmpdir" ] || [ -d "$cache" ]; then
+            if [ -n "$jid" ]; then
+                printf "  %-${w}s" "$jid run"
             else
                 printf "  %-${w}s" "run.."
             fi
