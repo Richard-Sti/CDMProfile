@@ -28,17 +28,21 @@ class SympyParser:
     """
     SymPy parser for expressions of the form `f(x, a0, a1, ...)`.
 
-    The variable `x` represents `r / Rs` (radius / scale radius).
+    The variable `x` represents `r / Rs` (radius / scale radius) when
+    `use_scaled_radius=True`, or simply `r` when `use_scaled_radius=False`.
     Parameters `a0, a1, ...` are free fitting parameters.
 
     Parameters
     ----------
     nfree_max : int, optional
         Maximum number of free parameters. Default is 4.
+    use_scaled_radius : bool, optional
+        If True (default), substitute x -> r/Rs. If False, substitute x -> r.
     """
 
-    def __init__(self, nfree_max=4):
+    def __init__(self, nfree_max=4, use_scaled_radius=True):
         self._nfree_max = nfree_max
+        self._use_scaled_radius = use_scaled_radius
 
         x, y, r, Rs = symbols('x y r Rs', real=True, positive=True)
 
@@ -66,6 +70,12 @@ class SympyParser:
         self._x = x
         self._r = r
         self._Rs = Rs
+
+    def _substitute_x(self, expr):
+        """Substitute x with r/Rs or r depending on use_scaled_radius."""
+        if self._use_scaled_radius:
+            return expr.subs(self._x, self._r / self._Rs)
+        return expr.subs(self._x, self._r)
 
     @property
     def nfree_max(self):
@@ -126,12 +136,12 @@ class SympyParser:
         expr = self.parse(expr_str)
         nfree = self.count_free(expr)
 
-        # Build parameter list: r, Rs, a0, a1, ...
+        # Build parameter list: r, Rs always present (C typedef requires it)
         params = ["r", "Rs"] + [f"a{i}" for i in range(nfree)]
         param_str = ", ".join(f"double {p}" for p in params)
 
-        # Replace x with r/Rs for the C code
-        expr_substituted = expr.subs(self._x, self._r / self._Rs)
+        # Replace x with r/Rs or r
+        expr_substituted = self._substitute_x(expr)
 
         # Generate C code for the expression
         c_expr = ccode(expr_substituted)
@@ -206,10 +216,13 @@ class SympyParser:
         expr = self.parse(expr_str)
         nfree = self.count_free(expr)
 
-        # Replace x with r/Rs
-        expr_substituted = expr.subs(self._x, self._r / self._Rs)
+        # Replace x with r/Rs or r
+        expr_substituted = self._substitute_x(expr)
 
-        params = [self._r, self._Rs] + self._free_params[:nfree]
+        if self._use_scaled_radius:
+            params = [self._r, self._Rs] + self._free_params[:nfree]
+        else:
+            params = [self._r] + self._free_params[:nfree]
         return lambdify(params, expr_substituted, "numpy")
 
     def to_cfunc(self, expr_str, function_name="rho"):
@@ -236,11 +249,14 @@ class SympyParser:
         nfree = self.count_free(expr)
 
         # Parameters: r is vectorized, rest are scalars
-        scalar_params = ["Rs"] + [f"a{i}" for i in range(nfree)]
+        if self._use_scaled_radius:
+            scalar_params = ["Rs"] + [f"a{i}" for i in range(nfree)]
+        else:
+            scalar_params = [f"a{i}" for i in range(nfree)]
         scalar_param_str = ", ".join(f"double {p}" for p in scalar_params)
 
-        # Replace x with r/Rs
-        expr_substituted = expr.subs(self._x, self._r / self._Rs)
+        # Replace x with r/Rs or r
+        expr_substituted = self._substitute_x(expr)
         c_expr = ccode(expr_substituted)
 
         # C source code

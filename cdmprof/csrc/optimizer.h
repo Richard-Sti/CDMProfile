@@ -39,6 +39,7 @@ typedef struct {
     SimpsonGrid grid;  /* Precomputed Simpson integration grid */
     DensityFunc rho;
     int nparams;
+    int has_Rs;          /* 1 if params[0] is Rs (log-transformed), 0 if all params are linear */
     double min_density;  /* Minimum density threshold (underflow protection) */
 } ObjectiveData;
 
@@ -54,10 +55,11 @@ typedef struct {
  *   rmin           - Minimum radius for mass integration
  *   rmax           - Maximum radius for mass integration
  *   rho            - Density function pointer
- *   nparams        - Number of parameters (1 + number of free params)
- *   initial_params - Initial guess [Rs, a0, a1, ...] in physical space
- *   lower_bounds   - Lower bounds [Rs_min, a0_min, ...] in physical space
- *   upper_bounds   - Upper bounds [Rs_max, a0_max, ...] in physical space
+ *   nparams        - Number of parameters (1 + nfree if has_Rs, nfree otherwise)
+ *   has_Rs         - 1 if params[0] is Rs (log-transformed), 0 if no Rs
+ *   initial_params - Initial guess [Rs, a0, a1, ...] or [a0, a1, ...] in physical space
+ *   lower_bounds   - Lower bounds in physical space
+ *   upper_bounds   - Upper bounds in physical space
  *   xtol           - Relative tolerance on parameters
  *   ftol           - Relative tolerance on function value
  *   maxeval        - Maximum function evaluations
@@ -70,7 +72,8 @@ typedef struct {
  */
 void fit_profile(double* bin_counts, double* bin_positions, int nbin,
                  int npart, double rmin, double rmax,
-                 DensityFunc rho, int nparams, double* initial_params,
+                 DensityFunc rho, int nparams, int has_Rs,
+                 double* initial_params,
                  double* lower_bounds, double* upper_bounds,
                  double xtol, double ftol, int maxeval,
                  int optimizer_type, double min_density,

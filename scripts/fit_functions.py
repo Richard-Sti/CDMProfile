@@ -242,7 +242,8 @@ def write_failed_to_files(output_path, categories, output_dir=None):
             print(f"  {fpath}")
 
 
-def compute_nfw_scores(binned, fit_config, return_per_halo=False):
+def compute_nfw_scores(binned, fit_config, return_per_halo=False,
+                       use_scaled_radius=True):
     """
     Compute the NFW reference score for comparison.
 
@@ -256,6 +257,8 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
         Fitting configuration parameters.
     return_per_halo : bool, optional
         If True, also return per-halo normalized losses.
+    use_scaled_radius : bool, optional
+        If True (default), x = r/Rs. If False, x = r.
 
     Returns
     -------
@@ -266,10 +269,14 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
     per_halo_scores : np.ndarray or None (only if return_per_halo=True)
         Per-halo loss/npart values (nan for failed fits).
     """
-    nfw_expr = "1 / (x * (1 + x)**2)"
+    if use_scaled_radius:
+        nfw_expr = "1 / (x * (1 + x)**2)"
+    else:
+        nfw_expr = "1 / (x / a0 * (1 + x / a0)**2)"
 
     try:
-        fitter = cdmprof.compile_fitter(nfw_expr)
+        fitter = cdmprof.compile_fitter(
+            nfw_expr, use_scaled_radius=use_scaled_radius)
     except Exception as e:
         print(f"Failed to compile NFW profile: {e}", flush=True)
         if return_per_halo:
@@ -949,7 +956,8 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
                 continue
 
             try:
-                fitter = cdmprof.compile_fitter(expr_str)
+                fitter = cdmprof.compile_fitter(
+                    expr_str, use_scaled_radius=use_scaled_radius)
             except Exception as e:
                 print(f"{_timestamp()} Rank {rank}: failed to compile "
                       f"func {func_idx} '{expr_str}': {e}", flush=True)
@@ -1000,7 +1008,8 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
         avg_per_func = batch_time / n_funcs_batch if n_funcs_batch > 0 else 0
 
         # Write results after each batch for resume support
-        has_data = (len(results_buffer) > 0 or len(negative_loss_func_idx) > 0
+        has_data = (len(results_buffer) > 0
+                    or len(negative_loss_func_idx) > 0
                     or len(processed_func_idx) > 0)
         if has_data:
             ResultsFile(output_path).append(
@@ -1089,6 +1098,22 @@ if __name__ == "__main__":
 
     # Load equations (all ranks)
     equations = cdmprof.fitting.load_equations(equations_path)
+    use_scaled_radius = fit_config.get('use_scaled_radius', True)
+    dry_run = fit_config.get('dry_run', False)
+
+    if not use_scaled_radius and rank == 0:
+        print("Variable substitution: x = r (no scale radius)", flush=True)
+        print("  Rs_lower_factor and Rs_upper_factor will be ignored",
+              flush=True)
+        a_lo = fit_config.get('a_lower', -10.0)
+        a_hi = fit_config.get('a_upper', 10.0)
+        if a_lo > -1000 or a_hi < 1000:
+            raise ValueError(
+                f"When use_scaled_radius=false, a_lower/a_upper should span "
+                f"at least [-1000, 1000] (got [{a_lo}, {a_hi}])")
+
+    if dry_run and rank == 0:
+        print("DRY RUN: results will not be saved to disk", flush=True)
 
     # Load skip file and asymptotes (pre-computed invalid functions)
     skip_func_idx = set()
@@ -1260,7 +1285,8 @@ if __name__ == "__main__":
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score, nfw_bic, nfw_per_halo = compute_nfw_scores(
-                    binned, fit_config, return_per_halo=True)
+                    binned, fit_config, return_per_halo=True,
+                    use_scaled_radius=use_scaled_radius)
             if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
                       flush=True)
@@ -1317,7 +1343,8 @@ if __name__ == "__main__":
                 continue
 
             try:
-                fitter = cdmprof.compile_fitter(expr_str)
+                fitter = cdmprof.compile_fitter(
+                    expr_str, use_scaled_radius=use_scaled_radius)
             except Exception as e:
                 print(f"Failed to compile func {func_idx} '{expr_str}': {e}",
                       flush=True)
@@ -1379,7 +1406,8 @@ if __name__ == "__main__":
                   flush=True)
 
         # Flush any remaining buffered results
-        has_data = (len(results_buffer) > 0 or len(negative_loss_func_idx) > 0
+        has_data = (len(results_buffer) > 0
+                    or len(negative_loss_func_idx) > 0
                     or len(processed_func_idx) > 0)
         if has_data:
             ResultsFile(temp_output).append(
@@ -1398,7 +1426,9 @@ if __name__ == "__main__":
         print(f"[timing] ResultsFile.merge: {time()-t0:.2f}s", flush=True)
         if temp_dir.exists():
             temp_dir.rmdir()
-        print(f"All done! Results saved to: {output_path}", flush=True)
+
+        if not dry_run:
+            print(f"All done! Results saved to: {output_path}", flush=True)
 
         # Print timing summary
         total_time = time() - t_start
@@ -1412,9 +1442,10 @@ if __name__ == "__main__":
 
         # Print failed functions (returns categories for reuse)
         t0 = time()
-        failed_categories = print_failed_functions(output_path, equations,
-                                                   skip_dict=skip_dict)
-        print(f"[timing] print_failed_functions: {time()-t0:.2f}s", flush=True)
+        failed_categories = print_failed_functions(
+            output_path, equations, skip_dict=skip_dict)
+        print(f"[timing] print_failed_functions: {time()-t0:.2f}s",
+              flush=True)
 
         # Compute NFW reference score (reuse if already computed)
         if nfw_score is None:
@@ -1422,8 +1453,11 @@ if __name__ == "__main__":
             print("Computing NFW reference score...", flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
-                nfw_score, nfw_bic = compute_nfw_scores(binned, fit_config)
-            print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s", flush=True)
+                nfw_score, nfw_bic = compute_nfw_scores(
+                        binned, fit_config,
+                        use_scaled_radius=use_scaled_radius)
+            print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s",
+                  flush=True)
 
         t0 = time()
         min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
@@ -1432,21 +1466,29 @@ if __name__ == "__main__":
                            nfw_score=nfw_score, nfw_bic=nfw_bic,
                            min_success_fraction=min_success_frac,
                            failure_loss_percentile=failure_percentile)
-        print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
+        print(f"[timing] print_best_results: {time()-t0:.2f}s",
+              flush=True)
 
-        # Save results to text files if enabled
-        if fit_config.get('save_text_results', True):
+        # Save results to text files if enabled (skip in dry run)
+        if not dry_run and fit_config.get('save_text_results', True):
             t0 = time()
-            write_ranking_to_file(output_path, equations, npart_per_halo,
-                                  nfw_score=nfw_score, nfw_bic=nfw_bic,
-                                  min_success_fraction=min_success_frac,
-                                  failure_loss_percentile=failure_percentile)
+            write_ranking_to_file(
+                output_path, equations, npart_per_halo,
+                nfw_score=nfw_score, nfw_bic=nfw_bic,
+                min_success_fraction=min_success_frac,
+                failure_loss_percentile=failure_percentile)
             print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
                   flush=True)
             t0 = time()
             write_failed_to_files(output_path, failed_categories)
             print(f"[timing] write_failed_to_files: {time()-t0:.2f}s",
                   flush=True)
+
+        # In dry run mode, clean up the output file
+        if dry_run:
+            if output_path.exists():
+                output_path.unlink()
+            print("DRY RUN: output file removed", flush=True)
 
     else:
         # Multi-process mode: master-worker pattern
@@ -1469,7 +1511,8 @@ if __name__ == "__main__":
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score, nfw_bic, nfw_per_halo = compute_nfw_scores(
-                    binned, fit_config, return_per_halo=True)
+                    binned, fit_config, return_per_halo=True,
+                    use_scaled_radius=use_scaled_radius)
             if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
                       flush=True)
@@ -1507,18 +1550,22 @@ if __name__ == "__main__":
             npart_per_halo = [np.sum(bc) for bc in binned['bin_counts']]
 
             t0 = time()
-            ResultsFile.merge(temp_dir, output_path, delete_rank_files=True,
+            ResultsFile.merge(temp_dir, output_path,
+                              delete_rank_files=True,
                               append_to_existing=args.resume,
                               npart_per_halo=npart_per_halo)
             print(f"[timing] ResultsFile.merge: {time()-t0:.2f}s", flush=True)
             if temp_dir.exists():
                 temp_dir.rmdir()
-            print(f"All done! Results saved to: {output_path}", flush=True)
+
+            if not dry_run:
+                print(f"All done! Results saved to: {output_path}",
+                      flush=True)
 
             # Print failed functions (returns categories for reuse)
             t0 = time()
-            failed_categories = print_failed_functions(output_path, equations,
-                                                       skip_dict=skip_dict)
+            failed_categories = print_failed_functions(
+                output_path, equations, skip_dict=skip_dict)
             print(f"[timing] print_failed_functions: {time()-t0:.2f}s",
                   flush=True)
 
@@ -1527,26 +1574,34 @@ if __name__ == "__main__":
                 t0 = time()
                 print("Computing NFW reference score...", flush=True)
                 with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message="reimporting")
-                    nfw_score, nfw_bic = compute_nfw_scores(binned, fit_config)
+                    warnings.filterwarnings(
+                        "ignore", message="reimporting")
+                    nfw_score, nfw_bic = compute_nfw_scores(
+                        binned, fit_config,
+                        use_scaled_radius=use_scaled_radius)
                 print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s",
                       flush=True)
 
             t0 = time()
-            min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
-            failure_percentile = fit_config.get('failure_loss_percentile', 0)
-            print_best_results(output_path, equations, npart_per_halo,
-                               nfw_score=nfw_score,
-                               min_success_fraction=min_success_frac,
-                               failure_loss_percentile=failure_percentile)
-            print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
+            min_success_frac = fit_config.get(
+                'min_halo_success_fraction', 0.0)
+            failure_percentile = fit_config.get(
+                'failure_loss_percentile', 0)
+            print_best_results(
+                output_path, equations, npart_per_halo,
+                nfw_score=nfw_score,
+                min_success_fraction=min_success_frac,
+                failure_loss_percentile=failure_percentile)
+            print(f"[timing] print_best_results: {time()-t0:.2f}s",
+                  flush=True)
 
-            # Save results to text files if enabled
-            if fit_config.get('save_text_results', True):
+            # Save results to text files if enabled (skip in dry run)
+            if not dry_run and fit_config.get('save_text_results', True):
                 t0 = time()
                 write_ranking_to_file(
                     output_path, equations, npart_per_halo,
-                    nfw_score=nfw_score, min_success_fraction=min_success_frac,
+                    nfw_score=nfw_score,
+                    min_success_fraction=min_success_frac,
                     failure_loss_percentile=failure_percentile)
                 print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
                       flush=True)
@@ -1554,6 +1609,12 @@ if __name__ == "__main__":
                 write_failed_to_files(output_path, failed_categories)
                 print(f"[timing] write_failed_to_files: {time()-t0:.2f}s",
                       flush=True)
+
+            # In dry run mode, clean up the output file
+            if dry_run:
+                if output_path.exists():
+                    output_path.unlink()
+                print("DRY RUN: output file removed", flush=True)
 
             # Print worker timing summary
             total_mpi_time = time() - t_mpi_start
