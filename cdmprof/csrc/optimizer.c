@@ -38,12 +38,22 @@ static double nlopt_objective(unsigned n, const double* x,
     ObjectiveData* obj = (ObjectiveData*)data;
     eval_count++;
 
-    /* Transform from internal to physical space: Rs = exp(x[0]) */
-    double Rs = exp(x[0]);
-    double a0 = (obj->nparams >= 2) ? x[1] : 0.0;
-    double a1 = (obj->nparams >= 3) ? x[2] : 0.0;
-    double a2 = (obj->nparams >= 4) ? x[3] : 0.0;
-    double a3 = (obj->nparams >= 5) ? x[4] : 0.0;
+    double Rs, a0, a1, a2, a3;
+    if (obj->has_Rs) {
+        /* params[0] is Rs in log-space */
+        Rs = exp(x[0]);
+        a0 = (obj->nparams >= 2) ? x[1] : 0.0;
+        a1 = (obj->nparams >= 3) ? x[2] : 0.0;
+        a2 = (obj->nparams >= 4) ? x[3] : 0.0;
+        a3 = (obj->nparams >= 5) ? x[4] : 0.0;
+    } else {
+        /* No Rs parameter; all params are free coefficients */
+        Rs = 1.0;
+        a0 = (obj->nparams >= 1) ? x[0] : 0.0;
+        a1 = (obj->nparams >= 2) ? x[1] : 0.0;
+        a2 = (obj->nparams >= 3) ? x[2] : 0.0;
+        a3 = (obj->nparams >= 4) ? x[3] : 0.0;
+    }
 
     return compute_loss(obj->bin_counts, obj->bin_positions, obj->nbin,
                         obj->npart, &obj->grid,
@@ -53,7 +63,8 @@ static double nlopt_objective(unsigned n, const double* x,
 
 void fit_profile(double* bin_counts, double* bin_positions, int nbin,
                  int npart, double rmin, double rmax,
-                 DensityFunc rho, int nparams, double* initial_params,
+                 DensityFunc rho, int nparams, int has_Rs,
+                 double* initial_params,
                  double* lower_bounds, double* upper_bounds,
                  double xtol, double ftol, int maxeval,
                  int optimizer_type, double min_density,
@@ -68,6 +79,7 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
     obj_data.npart = npart;
     obj_data.rho = rho;
     obj_data.nparams = nparams;
+    obj_data.has_Rs = has_Rs;
     obj_data.min_density = min_density;
 
     /* Precompute Simpson grid once for entire optimization */
@@ -92,14 +104,23 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
         return;
     }
 
-    /* Transform bounds to internal space: log(Rs) for first param */
+    /* Transform bounds to internal space */
     double* lb = (double*)malloc(nparams * sizeof(double));
     double* ub = (double*)malloc(nparams * sizeof(double));
-    lb[0] = log(lower_bounds[0]);
-    ub[0] = log(upper_bounds[0]);
-    for (int i = 1; i < nparams; i++) {
-        lb[i] = lower_bounds[i];
-        ub[i] = upper_bounds[i];
+    if (has_Rs) {
+        /* log(Rs) for first param */
+        lb[0] = log(lower_bounds[0]);
+        ub[0] = log(upper_bounds[0]);
+        for (int i = 1; i < nparams; i++) {
+            lb[i] = lower_bounds[i];
+            ub[i] = upper_bounds[i];
+        }
+    } else {
+        /* All params are linear */
+        for (int i = 0; i < nparams; i++) {
+            lb[i] = lower_bounds[i];
+            ub[i] = upper_bounds[i];
+        }
     }
     nlopt_set_lower_bounds(opt, lb);
     nlopt_set_upper_bounds(opt, ub);
@@ -112,11 +133,17 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
     nlopt_set_ftol_rel(opt, ftol);
     nlopt_set_maxeval(opt, maxeval);
 
-    /* Transform initial params to internal space: x[0] = log(Rs) */
+    /* Transform initial params to internal space */
     double* x = (double*)malloc(nparams * sizeof(double));
-    x[0] = log(initial_params[0]);
-    for (int i = 1; i < nparams; i++) {
-        x[i] = initial_params[i];
+    if (has_Rs) {
+        x[0] = log(initial_params[0]);
+        for (int i = 1; i < nparams; i++) {
+            x[i] = initial_params[i];
+        }
+    } else {
+        for (int i = 0; i < nparams; i++) {
+            x[i] = initial_params[i];
+        }
     }
 
     /* Reset evaluation counter */
@@ -126,14 +153,20 @@ void fit_profile(double* bin_counts, double* bin_positions, int nbin,
     double minf;
     nlopt_result nlopt_ret = nlopt_optimize(opt, x, &minf);
 
-    /* Store results (transform Rs back to physical space) */
+    /* Store results (transform back to physical space) */
     *out_converged = (nlopt_ret > 0) ? 1 : 0;
     *out_loss = minf;
     *out_neval = eval_count;
 
-    out_params[0] = exp(x[0]);  /* log(Rs) -> Rs */
-    for (int i = 1; i < nparams; i++) {
-        out_params[i] = x[i];
+    if (has_Rs) {
+        out_params[0] = exp(x[0]);  /* log(Rs) -> Rs */
+        for (int i = 1; i < nparams; i++) {
+            out_params[i] = x[i];
+        }
+    } else {
+        for (int i = 0; i < nparams; i++) {
+            out_params[i] = x[i];
+        }
     }
 
     /* Cleanup */

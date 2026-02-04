@@ -18,7 +18,10 @@ MPI script for fitting density profiles to halo data.
 Uses dynamic work distribution (master-worker pattern) where rank 0
 distributes batches of functions to worker ranks.
 """
+import os
+import pickle
 import shutil
+import tempfile
 import warnings
 from argparse import ArgumentParser
 from datetime import datetime
@@ -242,7 +245,8 @@ def write_failed_to_files(output_path, categories, output_dir=None):
             print(f"  {fpath}")
 
 
-def compute_nfw_scores(binned, fit_config, return_per_halo=False):
+def compute_nfw_scores(binned, fit_config, return_per_halo=False,
+                       use_scaled_radius=True):
     """
     Compute the NFW reference score for comparison.
 
@@ -256,6 +260,8 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
         Fitting configuration parameters.
     return_per_halo : bool, optional
         If True, also return per-halo normalized losses.
+    use_scaled_radius : bool, optional
+        If True (default), x = r/Rs. If False, x = r.
 
     Returns
     -------
@@ -266,10 +272,14 @@ def compute_nfw_scores(binned, fit_config, return_per_halo=False):
     per_halo_scores : np.ndarray or None (only if return_per_halo=True)
         Per-halo loss/npart values (nan for failed fits).
     """
-    nfw_expr = "1 / (x * (1 + x)**2)"
+    if use_scaled_radius:
+        nfw_expr = "1 / (x * (1 + x)**2)"
+    else:
+        nfw_expr = "1 / (x / a0 * (1 + x / a0)**2)"
 
     try:
-        fitter = cdmprof.compile_fitter(nfw_expr)
+        fitter = cdmprof.compile_fitter(
+            nfw_expr, use_scaled_radius=use_scaled_radius)
     except Exception as e:
         print(f"Failed to compile NFW profile: {e}", flush=True)
         if return_per_halo:
@@ -513,6 +523,122 @@ def fit_function_to_halos(func_idx, fitter, binned, fit_config,
         'nfw_early_stopped': nfw_early_stopped,
         'nfw_avg': nfw_avg,
     }
+
+
+def _process_batch_in_subprocess(func_indices, equations, binned, fit_config,
+                                 nfw_config, nfw_per_halo,
+                                 use_scaled_radius, log_prefix="",
+                                 progress_offset=0, progress_total=0):
+    """
+    Fork a child process to compile and fit a batch of functions.
+
+    The child compiles fitters (which dlopen .so files via CFFI) and fits
+    them. On exit, the OS reclaims all dlopen'd memory. Results are passed
+    back via a temporary pickle file.
+
+    Parameters
+    ----------
+    func_indices : list of int
+        Function indices to process in this batch.
+    equations : list of str
+        All equations (indexed by func_idx).
+    binned : dict
+        Binned halo data.
+    fit_config : dict
+        Fitting configuration.
+    nfw_config : dict
+        NFW early stop configuration.
+    nfw_per_halo : np.ndarray or None
+        Per-halo NFW normalized losses.
+    use_scaled_radius : bool
+        Whether to use scaled radius.
+    log_prefix : str, optional
+        Prefix for log messages.
+    progress_offset : int, optional
+        Offset for progress logging (e.g., batch start index).
+    progress_total : int, optional
+        Total number of functions for progress logging.
+
+    Returns
+    -------
+    list of tuple
+        Each tuple is (func_idx, status, fit_result) where status is one of
+        'skipped', 'compile_error', 'ok', and fit_result is the dict from
+        fit_function_to_halos (or None for skipped/compile_error).
+    """
+    # Create temp file for results before forking
+    fd, tmp_path = tempfile.mkstemp(suffix='.pkl')
+    os.close(fd)
+
+    pid = os.fork()
+
+    if pid == 0:
+        # === Child process ===
+        # Wrap everything in try/except so os._exit() is ALWAYS called.
+        # If the child exits normally, Python's atexit handlers run, which
+        # includes MPI.Finalize() registered by mpi4py — corrupting MPI
+        # state for the parent.
+        try:
+            results = []
+            for i, func_idx in enumerate(func_indices):
+                expr_str = equations[func_idx]
+
+                if progress_total > 0:
+                    progress_i = progress_offset + i + 1
+                    print(f"{_timestamp()} {log_prefix}[{progress_i}/"
+                          f"{progress_total}] Fitting '{expr_str}'",
+                          flush=True)
+
+                if cdmprof.fitting.is_bad_function(expr_str):
+                    results.append((func_idx, 'skipped', None))
+                    continue
+
+                try:
+                    fitter = cdmprof.compile_fitter(
+                        expr_str, use_scaled_radius=use_scaled_radius)
+                except Exception as e:
+                    print(f"{_timestamp()} {log_prefix}Failed to compile "
+                          f"func {func_idx} '{expr_str}': {e}", flush=True)
+                    results.append((func_idx, 'compile_error', None))
+                    continue
+
+                fit_result = fit_function_to_halos(
+                    func_idx, fitter, binned, fit_config,
+                    nfw_config, nfw_per_halo, log_prefix=log_prefix)
+                results.append((func_idx, 'ok', fit_result))
+
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            os._exit(0)
+        except BaseException:
+            import traceback
+            traceback.print_exc()
+            os._exit(1)
+
+    else:
+        # === Parent process ===
+        _, wait_status = os.waitpid(pid, 0)
+
+        if wait_status != 0:
+            if os.WIFEXITED(wait_status):
+                code = os.WEXITSTATUS(wait_status)
+                msg = f"exit code {code}"
+            elif os.WIFSIGNALED(wait_status):
+                msg = f"signal {os.WTERMSIG(wait_status)}"
+            else:
+                msg = f"status {wait_status}"
+            print(f"{_timestamp()} {log_prefix}Child process failed: {msg}",
+                  flush=True)
+            os.unlink(tmp_path)
+            # Return all as compile errors so parent can continue
+            return [(idx, 'compile_error', None) for idx in func_indices]
+
+        with open(tmp_path, 'rb') as f:
+            results = pickle.load(f)
+        os.unlink(tmp_path)
+
+        return results
 
 
 class ResultsFile:
@@ -915,8 +1041,6 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
     negative_loss_func_idx = set()
     processed_func_idx = set()  # Track all attempted functions
 
-    # Timing tracking
-    total_fit_time = 0.0
     t_worker_start = time()
 
     # NFW comparison settings (multi-tier early stopping)
@@ -934,34 +1058,22 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
         if status.tag == DONE_TAG:
             break
 
-        # Process batch of functions
+        # Process batch in a forked subprocess to reclaim dlopen'd memory
         t_batch_start = time()
         n_funcs_batch = len(batch)
 
-        for func_idx in batch:
-            expr_str = equations[func_idx]
+        batch_results = _process_batch_in_subprocess(
+            batch, equations, binned, fit_config,
+            nfw_config, nfw_per_halo,
+            use_scaled_radius,
+            log_prefix=f"Rank {rank}: ")
 
-            # Mark as processed regardless of outcome
+        for func_idx, func_status, fit_result in batch_results:
+            expr_str = equations[func_idx]
             processed_func_idx.add(func_idx)
 
-            # Skip bad functions silently
-            if cdmprof.fitting.is_bad_function(expr_str):
+            if func_status == 'skipped' or func_status == 'compile_error':
                 continue
-
-            try:
-                fitter = cdmprof.compile_fitter(expr_str)
-            except Exception as e:
-                print(f"{_timestamp()} Rank {rank}: failed to compile "
-                      f"func {func_idx} '{expr_str}': {e}", flush=True)
-                continue
-
-            # Fit to all halos
-            t_fit_start = time()
-            fit_result = fit_function_to_halos(
-                func_idx, fitter, binned, fit_config,
-                nfw_config, nfw_per_halo,
-                log_prefix=f"Rank {rank}: ")
-            total_fit_time += time() - t_fit_start
 
             # Handle early stopping
             if fit_result['early_stopped']:
@@ -1000,7 +1112,8 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
         avg_per_func = batch_time / n_funcs_batch if n_funcs_batch > 0 else 0
 
         # Write results after each batch for resume support
-        has_data = (len(results_buffer) > 0 or len(negative_loss_func_idx) > 0
+        has_data = (len(results_buffer) > 0
+                    or len(negative_loss_func_idx) > 0
                     or len(processed_func_idx) > 0)
         if has_data:
             ResultsFile(output_path).append(
@@ -1019,7 +1132,7 @@ def worker_loop(comm, equations, binned, output_dir, fit_config,
           f"{total_results_written} total results", flush=True)
 
     # Return timing data for aggregation
-    return total_fit_time, total_worker_time
+    return total_worker_time
 
 
 if __name__ == "__main__":
@@ -1089,6 +1202,22 @@ if __name__ == "__main__":
 
     # Load equations (all ranks)
     equations = cdmprof.fitting.load_equations(equations_path)
+    use_scaled_radius = fit_config.get('use_scaled_radius', True)
+    dry_run = fit_config.get('dry_run', False)
+
+    if not use_scaled_radius and rank == 0:
+        print("Variable substitution: x = r (no scale radius)", flush=True)
+        print("  Rs_lower_factor and Rs_upper_factor will be ignored",
+              flush=True)
+        a_lo = fit_config.get('a_lower', -10.0)
+        a_hi = fit_config.get('a_upper', 10.0)
+        if a_lo > -1000 or a_hi < 1000:
+            raise ValueError(
+                f"When use_scaled_radius=false, a_lower/a_upper should span "
+                f"at least [-1000, 1000] (got [{a_lo}, {a_hi}])")
+
+    if dry_run and rank == 0:
+        print("DRY RUN: results will not be saved to disk", flush=True)
 
     # Load skip file and asymptotes (pre-computed invalid functions)
     skip_func_idx = set()
@@ -1260,7 +1389,8 @@ if __name__ == "__main__":
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score, nfw_bic, nfw_per_halo = compute_nfw_scores(
-                    binned, fit_config, return_per_halo=True)
+                    binned, fit_config, return_per_halo=True,
+                    use_scaled_radius=use_scaled_radius)
             if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
                       flush=True)
@@ -1286,105 +1416,78 @@ if __name__ == "__main__":
 
         n_funcs = len(job_queue)
         t_start = time()
-        total_fit_time = 0.0
 
         early_stop_threshold = fit_config.get('early_stop_failures', 5)
 
-        for i, func_idx in enumerate(job_queue):
-            # Write results every N functions for resume support
-            # Check at start so continue statements don't skip the write
-            if i > 0 and i % write_buffer_size == 0:
-                has_data = (len(results_buffer) > 0
-                            or len(negative_loss_func_idx) > 0
-                            or len(processed_func_idx) > 0)
-                if has_data:
-                    ResultsFile(temp_output).append(
-                        results_buffer, equations, negative_loss_func_idx,
-                        processed_func_idx, nfw_score)
-                    results_buffer = []  # Clear buffer after writing
+        for batch_start in range(0, n_funcs, write_buffer_size):
+            batch = job_queue[batch_start:batch_start + write_buffer_size]
+            t_batch_start = time()
 
-            t_func_start = time()
-            expr_str = equations[func_idx]
+            # Process batch in a forked subprocess
+            batch_results = _process_batch_in_subprocess(
+                batch, equations, binned, fit_config,
+                nfw_config, nfw_per_halo,
+                use_scaled_radius, log_prefix="",
+                progress_offset=batch_start, progress_total=n_funcs)
 
-            # Mark as processed regardless of outcome
-            processed_func_idx.add(func_idx)
+            for func_idx, func_status, fit_result in batch_results:
+                expr_str = equations[func_idx]
+                processed_func_idx.add(func_idx)
 
-            # Print progress
-            print(f"[{i+1}/{n_funcs}] Fitting '{expr_str}'", flush=True)
+                if func_status == 'skipped' or func_status == 'compile_error':
+                    continue
 
-            # Skip bad functions silently
-            if cdmprof.fitting.is_bad_function(expr_str):
-                continue
+                # Handle early stopping
+                if fit_result['early_stopped']:
+                    print(f"Func {func_idx} early stopped after "
+                          f"{early_stop_threshold} failures", flush=True)
+                    continue
 
-            try:
-                fitter = cdmprof.compile_fitter(expr_str)
-            except Exception as e:
-                print(f"Failed to compile func {func_idx} '{expr_str}': {e}",
-                      flush=True)
-                continue
+                if fit_result['nfw_early_stopped']:
+                    n_fitted = len(fit_result['results'])
+                    func_avg = np.mean(
+                        [r[2] / np.sum(binned['bin_counts'][r[1]])
+                         for r in fit_result['results']])
+                    print(f"NFW early stopped '{expr_str}' "
+                          f"(n={n_fitted}, avg={func_avg:.4f}, "
+                          f"nfw={fit_result['nfw_avg']:.4f})", flush=True)
+                    continue
 
-            # Fit to all halos
-            t_fit_start = time()
-            fit_result = fit_function_to_halos(
-                func_idx, fitter, binned, fit_config,
-                nfw_config, nfw_per_halo, log_prefix="")
-            func_fit_time = time() - t_fit_start
-            total_fit_time += func_fit_time
+                # Check if function should be rejected
+                n_success = len(fit_result['results'])
 
-            # Handle early stopping
-            if fit_result['early_stopped']:
-                print(f"Func {func_idx} early stopped after "
-                      f"{early_stop_threshold} failures", flush=True)
-                continue
-
-            if fit_result['nfw_early_stopped']:
-                n_fitted = len(fit_result['results'])
-                func_avg = np.mean([r[2] / np.sum(binned['bin_counts'][r[1]])
-                                    for r in fit_result['results']])
-                print(f"NFW early stopped '{expr_str}' "
-                      f"(n={n_fitted}, avg={func_avg:.4f}, "
-                      f"nfw={fit_result['nfw_avg']:.4f})", flush=True)
-                continue
-
-            # Check if function should be rejected
-            n_success = len(fit_result['results'])
-
-            if n_success == 0:
-                if fit_result['n_negative_loss'] > 0:
-                    negative_loss_func_idx.add(func_idx)
-                    print(f"Func {func_idx} rejected (negative loss) "
-                          f"'{expr_str}'", flush=True)
+                if n_success == 0:
+                    if fit_result['n_negative_loss'] > 0:
+                        negative_loss_func_idx.add(func_idx)
+                        print(f"Func {func_idx} rejected (negative loss) "
+                              f"'{expr_str}'", flush=True)
+                    else:
+                        print(f"All fits failed for func {func_idx} "
+                              f"'{expr_str}'", flush=True)
                 else:
-                    print(f"All fits failed for func {func_idx} '{expr_str}'",
-                          flush=True)
-            else:
-                results_buffer.extend(fit_result['results'])
+                    results_buffer.extend(fit_result['results'])
 
-            func_time = time() - t_func_start
+            # Flush results after each batch for resume support
+            has_data = (len(results_buffer) > 0
+                        or len(negative_loss_func_idx) > 0
+                        or len(processed_func_idx) > 0)
+            if has_data:
+                ResultsFile(temp_output).append(
+                    results_buffer, equations, negative_loss_func_idx,
+                    processed_func_idx, nfw_score)
+                results_buffer = []
+
+            # Print batch-level ETA
+            batch_time = time() - t_batch_start
+            funcs_done = min(batch_start + len(batch), n_funcs)
             elapsed = time() - t_start
-            funcs_done = i + 1
-            avg_per_func = elapsed / funcs_done
+            avg_per_func = elapsed / funcs_done if funcs_done > 0 else 0
             remaining = avg_per_func * (n_funcs - funcs_done)
 
-            if remaining >= 3600:
-                eta_str = f"{remaining / 3600:.1f} h"
-            elif remaining >= 60:
-                eta_str = f"{remaining / 60:.1f} min"
-            else:
-                eta_str = f"{remaining:.1f} s"
-
             print(f"Completed {funcs_done}/{n_funcs} | "
-                  f"this: {func_time:.1f}s (fit={func_fit_time:.1f}s) | "
-                  f"avg: {avg_per_func:.1f}s/func | ETA: {eta_str}",
-                  flush=True)
-
-        # Flush any remaining buffered results
-        has_data = (len(results_buffer) > 0 or len(negative_loss_func_idx) > 0
-                    or len(processed_func_idx) > 0)
-        if has_data:
-            ResultsFile(temp_output).append(
-                results_buffer, equations, negative_loss_func_idx,
-                processed_func_idx, nfw_score)
+                  f"batch: {batch_time:.1f}s ({len(batch)} funcs) | "
+                  f"avg: {avg_per_func:.1f}s/func | "
+                  f"ETA: {format_time(remaining)}", flush=True)
 
         # Compute npart per halo (needed for merge and ranking)
         npart_per_halo = [np.sum(bc) for bc in binned['bin_counts']]
@@ -1398,23 +1501,20 @@ if __name__ == "__main__":
         print(f"[timing] ResultsFile.merge: {time()-t0:.2f}s", flush=True)
         if temp_dir.exists():
             temp_dir.rmdir()
-        print(f"All done! Results saved to: {output_path}", flush=True)
+
+        if not dry_run:
+            print(f"All done! Results saved to: {output_path}", flush=True)
 
         # Print timing summary
         total_time = time() - t_start
-        other_time = total_time - total_fit_time
-        print("\nTiming breakdown:", flush=True)
-        print(f"  Fitting: {total_fit_time:8.1f}s "
-              f"({100*total_fit_time/total_time:5.1f}%)", flush=True)
-        print(f"  Other:   {other_time:8.1f}s "
-              f"({100*other_time/total_time:5.1f}%)", flush=True)
-        print(f"  Total:   {total_time:8.1f}s", flush=True)
+        print(f"\nTotal wall time: {format_time(total_time)}", flush=True)
 
         # Print failed functions (returns categories for reuse)
         t0 = time()
-        failed_categories = print_failed_functions(output_path, equations,
-                                                   skip_dict=skip_dict)
-        print(f"[timing] print_failed_functions: {time()-t0:.2f}s", flush=True)
+        failed_categories = print_failed_functions(
+            output_path, equations, skip_dict=skip_dict)
+        print(f"[timing] print_failed_functions: {time()-t0:.2f}s",
+              flush=True)
 
         # Compute NFW reference score (reuse if already computed)
         if nfw_score is None:
@@ -1422,8 +1522,11 @@ if __name__ == "__main__":
             print("Computing NFW reference score...", flush=True)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
-                nfw_score, nfw_bic = compute_nfw_scores(binned, fit_config)
-            print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s", flush=True)
+                nfw_score, nfw_bic = compute_nfw_scores(
+                        binned, fit_config,
+                        use_scaled_radius=use_scaled_radius)
+            print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s",
+                  flush=True)
 
         t0 = time()
         min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
@@ -1432,21 +1535,29 @@ if __name__ == "__main__":
                            nfw_score=nfw_score, nfw_bic=nfw_bic,
                            min_success_fraction=min_success_frac,
                            failure_loss_percentile=failure_percentile)
-        print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
+        print(f"[timing] print_best_results: {time()-t0:.2f}s",
+              flush=True)
 
-        # Save results to text files if enabled
-        if fit_config.get('save_text_results', True):
+        # Save results to text files if enabled (skip in dry run)
+        if not dry_run and fit_config.get('save_text_results', True):
             t0 = time()
-            write_ranking_to_file(output_path, equations, npart_per_halo,
-                                  nfw_score=nfw_score, nfw_bic=nfw_bic,
-                                  min_success_fraction=min_success_frac,
-                                  failure_loss_percentile=failure_percentile)
+            write_ranking_to_file(
+                output_path, equations, npart_per_halo,
+                nfw_score=nfw_score, nfw_bic=nfw_bic,
+                min_success_fraction=min_success_frac,
+                failure_loss_percentile=failure_percentile)
             print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
                   flush=True)
             t0 = time()
             write_failed_to_files(output_path, failed_categories)
             print(f"[timing] write_failed_to_files: {time()-t0:.2f}s",
                   flush=True)
+
+        # In dry run mode, clean up the output file
+        if dry_run:
+            if output_path.exists():
+                output_path.unlink()
+            print("DRY RUN: output file removed", flush=True)
 
     else:
         # Multi-process mode: master-worker pattern
@@ -1469,7 +1580,8 @@ if __name__ == "__main__":
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="reimporting")
                 nfw_score, nfw_bic, nfw_per_halo = compute_nfw_scores(
-                    binned, fit_config, return_per_halo=True)
+                    binned, fit_config, return_per_halo=True,
+                    use_scaled_radius=use_scaled_radius)
             if nfw_per_halo is None or not np.any(~np.isnan(nfw_per_halo)):
                 print("NFW fitting failed, disabling NFW early stopping",
                       flush=True)
@@ -1507,18 +1619,22 @@ if __name__ == "__main__":
             npart_per_halo = [np.sum(bc) for bc in binned['bin_counts']]
 
             t0 = time()
-            ResultsFile.merge(temp_dir, output_path, delete_rank_files=True,
+            ResultsFile.merge(temp_dir, output_path,
+                              delete_rank_files=True,
                               append_to_existing=args.resume,
                               npart_per_halo=npart_per_halo)
             print(f"[timing] ResultsFile.merge: {time()-t0:.2f}s", flush=True)
             if temp_dir.exists():
                 temp_dir.rmdir()
-            print(f"All done! Results saved to: {output_path}", flush=True)
+
+            if not dry_run:
+                print(f"All done! Results saved to: {output_path}",
+                      flush=True)
 
             # Print failed functions (returns categories for reuse)
             t0 = time()
-            failed_categories = print_failed_functions(output_path, equations,
-                                                       skip_dict=skip_dict)
+            failed_categories = print_failed_functions(
+                output_path, equations, skip_dict=skip_dict)
             print(f"[timing] print_failed_functions: {time()-t0:.2f}s",
                   flush=True)
 
@@ -1527,26 +1643,34 @@ if __name__ == "__main__":
                 t0 = time()
                 print("Computing NFW reference score...", flush=True)
                 with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message="reimporting")
-                    nfw_score, nfw_bic = compute_nfw_scores(binned, fit_config)
+                    warnings.filterwarnings(
+                        "ignore", message="reimporting")
+                    nfw_score, nfw_bic = compute_nfw_scores(
+                        binned, fit_config,
+                        use_scaled_radius=use_scaled_radius)
                 print(f"[timing] compute_nfw_scores: {time()-t0:.2f}s",
                       flush=True)
 
             t0 = time()
-            min_success_frac = fit_config.get('min_halo_success_fraction', 0.0)
-            failure_percentile = fit_config.get('failure_loss_percentile', 0)
-            print_best_results(output_path, equations, npart_per_halo,
-                               nfw_score=nfw_score,
-                               min_success_fraction=min_success_frac,
-                               failure_loss_percentile=failure_percentile)
-            print(f"[timing] print_best_results: {time()-t0:.2f}s", flush=True)
+            min_success_frac = fit_config.get(
+                'min_halo_success_fraction', 0.0)
+            failure_percentile = fit_config.get(
+                'failure_loss_percentile', 0)
+            print_best_results(
+                output_path, equations, npart_per_halo,
+                nfw_score=nfw_score,
+                min_success_fraction=min_success_frac,
+                failure_loss_percentile=failure_percentile)
+            print(f"[timing] print_best_results: {time()-t0:.2f}s",
+                  flush=True)
 
-            # Save results to text files if enabled
-            if fit_config.get('save_text_results', True):
+            # Save results to text files if enabled (skip in dry run)
+            if not dry_run and fit_config.get('save_text_results', True):
                 t0 = time()
                 write_ranking_to_file(
                     output_path, equations, npart_per_halo,
-                    nfw_score=nfw_score, min_success_fraction=min_success_frac,
+                    nfw_score=nfw_score,
+                    min_success_fraction=min_success_frac,
                     failure_loss_percentile=failure_percentile)
                 print(f"[timing] write_ranking_to_file: {time()-t0:.2f}s",
                       flush=True)
@@ -1554,6 +1678,12 @@ if __name__ == "__main__":
                 write_failed_to_files(output_path, failed_categories)
                 print(f"[timing] write_failed_to_files: {time()-t0:.2f}s",
                       flush=True)
+
+            # In dry run mode, clean up the output file
+            if dry_run:
+                if output_path.exists():
+                    output_path.unlink()
+                print("DRY RUN: output file removed", flush=True)
 
             # Print worker timing summary
             total_mpi_time = time() - t_mpi_start
@@ -1563,22 +1693,15 @@ if __name__ == "__main__":
             if len(worker_timings) > 0:
                 print(f"\nWorker timing summary "
                       f"({len(worker_timings)} workers):", flush=True)
-                print(f"  {'Rank':<6} {'Fitting':>10} {'Other':>10} "
-                      f"{'Total':>10}", flush=True)
-                print(f"  {'-'*6} {'-'*10} {'-'*10} {'-'*10}", flush=True)
-                for rank_i, (fit_t, total_t) in worker_timings:
-                    other_t = total_t - fit_t
-                    print(f"  {rank_i:<6} {format_time(fit_t):>10} "
-                          f"{format_time(other_t):>10} "
-                          f"{format_time(total_t):>10}", flush=True)
-                # Print totals
-                total_fit = sum(t[0] for _, t in worker_timings)
-                total_cpu = sum(t[1] for _, t in worker_timings)
-                total_other = total_cpu - total_fit
-                print(f"  {'-'*6} {'-'*10} {'-'*10} {'-'*10}", flush=True)
-                print(f"  {'Total':<6} {format_time(total_fit):>10} "
-                      f"{format_time(total_other):>10} "
-                      f"{format_time(total_cpu):>10}", flush=True)
+                print(f"  {'Rank':<6} {'Total':>10}", flush=True)
+                print(f"  {'-'*6} {'-'*10}", flush=True)
+                for rank_i, total_t in worker_timings:
+                    print(f"  {rank_i:<6} {format_time(total_t):>10}",
+                          flush=True)
+                total_cpu = sum(t for _, t in worker_timings)
+                print(f"  {'-'*6} {'-'*10}", flush=True)
+                print(f"  {'Total':<6} {format_time(total_cpu):>10}",
+                      flush=True)
                 print(f"  Wall time: {format_time(total_mpi_time)}",
                       flush=True)
 

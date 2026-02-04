@@ -49,7 +49,7 @@ OPTIMIZER_MAP = {
 }
 
 
-def _generate_lhs_samples(param_bounds, n_samples, seed=None):
+def _generate_lhs_samples(param_bounds, n_samples, seed=None, has_Rs=True):
     """
     Generate initial parameters using Latin Hypercube Sampling.
 
@@ -57,11 +57,13 @@ def _generate_lhs_samples(param_bounds, n_samples, seed=None):
     ----------
     param_bounds : list of tuples
         List of (low, high) bounds for each parameter.
-        First parameter (Rs) is sampled log-uniformly.
+        When has_Rs is True, first parameter (Rs) is sampled log-uniformly.
     n_samples : int
         Number of samples to generate.
     seed : int, optional
         Random seed for reproducibility.
+    has_Rs : bool, optional
+        If True (default), first parameter is Rs (log-uniform sampling).
 
     Returns
     -------
@@ -76,7 +78,7 @@ def _generate_lhs_samples(param_bounds, n_samples, seed=None):
     # Scale to parameter bounds
     samples = np.zeros((n_samples, n_params), dtype=np.float64)
     for i, (low, high) in enumerate(param_bounds):
-        if i == 0:
+        if i == 0 and has_Rs:
             # Rs: log-uniform sampling
             log_low, log_high = np.log(low), np.log(high)
             samples[:, i] = np.exp(
@@ -194,14 +196,21 @@ def _get_nlopt_paths():
         return [], []
 
 
-def compile_fitter(expr_str, parser=None, simpson_n=512):
+def compile_fitter(expr_str, parser=None, simpson_n=512,
+                   use_scaled_radius=True):
     """
     JIT compile a density function + loss + optimizer.
 
     Returns a fit() function with fit.fit_with_restarts() for multi-restart.
+
+    Parameters
+    ----------
+    use_scaled_radius : bool, optional
+        If True (default), x = r/Rs and Rs is a fitted parameter.
+        If False, x = r and Rs is not fitted.
     """
     if parser is None:
-        parser = SympyParser()
+        parser = SympyParser(use_scaled_radius=use_scaled_radius)
 
     # Validate simpson_n
     if simpson_n % 2 != 0:
@@ -210,13 +219,14 @@ def compile_fitter(expr_str, parser=None, simpson_n=512):
     # Parse expression and count parameters
     expr = parser.parse(expr_str)
     nfree = parser.count_free(expr)
-    nparams = 1 + nfree  # Rs + free parameters
+    has_Rs = use_scaled_radius
+    nparams = (1 + nfree) if has_Rs else nfree  # Rs + free params, or just free
 
     # Detect parameters wrapped in Abs() for automatic positive bounds
     abs_wrapped_params = _detect_abs_wrapped_params(expr_str, parser)
 
     # Generate C code for density function
-    expr_substituted = expr.subs(parser._x, parser._r / parser._Rs)
+    expr_substituted = parser._substitute_x(expr)
     c_expr = ccode(expr_substituted)
 
     # Read static C files
@@ -239,7 +249,8 @@ double rho_func(double r, double Rs,
 """
 
     # Wrapper that binds rho_func to the generic fit_profile
-    wrapper_c = """
+    has_Rs_int = 1 if has_Rs else 0
+    wrapper_c = f"""
 /* Wrapper that uses the auto-generated rho_func */
 void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                          int npart, double rmin, double rmax,
@@ -248,14 +259,15 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
                          double xtol, double ftol, int maxeval,
                          int optimizer_type, double min_density,
                          double* out_params, double* out_loss,
-                         int* out_converged, int* out_neval) {
+                         int* out_converged, int* out_neval) {{
     fit_profile(bin_counts, bin_positions, nbin, npart, rmin, rmax,
-                rho_func, nparams, initial_params,
+                rho_func, nparams, {has_Rs_int},
+                initial_params,
                 lower_bounds, upper_bounds,
                 xtol, ftol, maxeval,
                 optimizer_type, min_density,
                 out_params, out_loss, out_converged, out_neval);
-}
+}}
 """
 
     # Combine: headers -> rho_func -> implementations -> wrapper
@@ -334,21 +346,29 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
 
         if initial_params is None:
             initial_params = np.ones(nparams, dtype=np.float64)
-            initial_params[0] = np.sqrt(bin_positions[0] * bin_positions[-1])
+            if has_Rs:
+                initial_params[0] = np.sqrt(
+                    bin_positions[0] * bin_positions[-1])
         else:
             initial_params = np.ascontiguousarray(
                 initial_params, dtype=np.float64)
 
         if lower_bounds is None:
-            lower_bounds = np.array(
-                [rmin / 4] + [-100.0] * nfree, dtype=np.float64)
+            if has_Rs:
+                lower_bounds = np.array(
+                    [rmin / 4] + [-100.0] * nfree, dtype=np.float64)
+            else:
+                lower_bounds = np.full(nparams, -100.0, dtype=np.float64)
         else:
             lower_bounds = np.ascontiguousarray(
                 lower_bounds, dtype=np.float64)
 
         if upper_bounds is None:
-            upper_bounds = np.array(
-                [10 * rmax] + [100.0] * nfree, dtype=np.float64)
+            if has_Rs:
+                upper_bounds = np.array(
+                    [10 * rmax] + [100.0] * nfree, dtype=np.float64)
+            else:
+                upper_bounds = np.full(nparams, 100.0, dtype=np.float64)
         else:
             upper_bounds = np.ascontiguousarray(
                 upper_bounds, dtype=np.float64)
@@ -404,7 +424,11 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         computing statistics across all halos, even those that didn't converge.
         """
         if param_bounds is None:
-            param_bounds = [(rmin * Rs_lower_factor, rmax * Rs_upper_factor)]
+            if has_Rs:
+                param_bounds = [
+                    (rmin * Rs_lower_factor, rmax * Rs_upper_factor)]
+            else:
+                param_bounds = []
             for i in range(nfree):
                 # If parameter is wrapped in Abs(), only need positive values
                 if i in abs_wrapped_params:
@@ -416,7 +440,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
         upper_bounds = np.array([b[1] for b in param_bounds], dtype=np.float64)
 
         # Pre-generate all initial points using Latin Hypercube Sampling
-        lhs_samples = _generate_lhs_samples(param_bounds, max_restarts, seed)
+        lhs_samples = _generate_lhs_samples(
+            param_bounds, max_restarts, seed, has_Rs=has_Rs)
 
         best_loss = np.inf
         best_loss_all = np.inf  # Track best loss including failed attempts
@@ -492,6 +517,7 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
     fit.expr_str = expr_str
     fit.nparams = nparams
     fit.nfree = nfree
+    fit.has_Rs = has_Rs
     fit.simpson_n = simpson_n
     fit.abs_wrapped_params = abs_wrapped_params
     fit.fit_with_restarts = fit_with_restarts
@@ -504,7 +530,8 @@ void fit_profile_wrapper(double* bin_counts, double* bin_positions, int nbin,
 ###############################################################################
 
 
-def compile_nested_fitter(expr_str, parser=None, simpson_n=512):
+def compile_nested_fitter(expr_str, parser=None, simpson_n=512,
+                          use_scaled_radius=True):
     """
     JIT compile a nested fitter for global + local parameter optimization.
 
@@ -519,6 +546,9 @@ def compile_nested_fitter(expr_str, parser=None, simpson_n=512):
         Parser instance for expression parsing.
     simpson_n : int, optional
         Number of points for Simpson integration. Default: 512.
+    use_scaled_radius : bool, optional
+        If True (default), x = r/Rs and Rs is a fitted parameter.
+        If False, x = r and Rs is not fitted.
 
     Returns
     -------
@@ -526,7 +556,7 @@ def compile_nested_fitter(expr_str, parser=None, simpson_n=512):
         Object with fit() method for nested optimization.
     """
     if parser is None:
-        parser = SympyParser()
+        parser = SympyParser(use_scaled_radius=use_scaled_radius)
 
     if simpson_n % 2 != 0:
         raise ValueError(f"simpson_n must be even, got {simpson_n}")
@@ -537,7 +567,7 @@ def compile_nested_fitter(expr_str, parser=None, simpson_n=512):
     nparams = 1 + nfree  # Rs + free parameters
 
     # Generate C code for density function
-    expr_substituted = expr.subs(parser._x, parser._r / parser._Rs)
+    expr_substituted = parser._substitute_x(expr)
     c_expr = ccode(expr_substituted)
 
     # Read static C files

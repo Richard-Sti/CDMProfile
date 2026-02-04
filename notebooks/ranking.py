@@ -128,6 +128,9 @@ def load_all(particle_file, results_dir, result_pattern, complexities):
     max_fidx = int(func_idx.max()) + 1 if len(func_idx) > 0 else 1
     global_fid = comp_arr.astype(np.int64) * max_fidx + func_idx
 
+    # Uniform halo weights (single snapshot).
+    halo_weight = np.ones(n_halos, dtype=np.float64)
+
     return {
         # Particle metadata.
         "M200c": M200c,
@@ -136,6 +139,7 @@ def load_all(particle_file, results_dir, result_pattern, complexities):
         "npart_per_halo": npart_per_halo,
         "n_halos": n_halos,
         "units_M200c": units_M200c,
+        "halo_weight": halo_weight,
         # Per-result arrays.
         "comp": comp_arr,
         "func_idx": func_idx,
@@ -154,7 +158,7 @@ def load_all(particle_file, results_dir, result_pattern, complexities):
 
 
 def load_all_multi(particle_files, results_dir, result_patterns,
-                    complexities):
+                    complexities, reweight_snapshots=False):
     """
     Load and concatenate halos from multiple particle/result file pairs.
 
@@ -169,6 +173,10 @@ def load_all_multi(particle_files, results_dir, result_patterns,
         `particle_files`.
     complexities : list of int
         Complexity levels to load.
+    reweight_snapshots : bool, optional
+        If True, assign per-halo weights so that each snapshot contributes
+        equally to the average scores, regardless of how many halos it has.
+        Default is False (uniform weights).
 
     Returns
     -------
@@ -227,6 +235,31 @@ def load_all_multi(particle_files, results_dir, result_patterns,
                 if p["nfw_scores"].get(comp) is not None]
         nfw_scores[comp] = float(np.mean(vals)) if vals else None
 
+    # --- Per-halo weights ---
+    if reweight_snapshots:
+        # Each snapshot contributes equally: weight = 1 / n_halos_in_snapshot,
+        # then normalised so weights sum to n_halos (like uniform weights).
+        n_snaps = len(parts)
+        halo_weight = np.empty(n_halos, dtype=np.float64)
+        offset = 0
+        for p in parts:
+            n_h = p["n_halos"]
+            # w_i = (n_halos / n_snaps) / n_h  so sum(w) = n_halos
+            halo_weight[offset:offset + n_h] = n_halos / (n_snaps * n_h)
+            offset += n_h
+        print(f"  Snapshot reweighting enabled "
+              f"({', '.join(str(p['n_halos']) for p in parts)} halos)")
+    else:
+        halo_weight = np.ones(n_halos, dtype=np.float64)
+
+    # --- Per-halo snapshot index ---
+    snap_idx = np.empty(n_halos, dtype=np.int32)
+    offset = 0
+    for si, p in enumerate(parts):
+        n_h = p["n_halos"]
+        snap_idx[offset:offset + n_h] = si
+        offset += n_h
+
     print(f"\nCombined: {n_halos} halos from {len(parts)} files")
 
     return {
@@ -236,6 +269,9 @@ def load_all_multi(particle_files, results_dir, result_patterns,
         "npart_per_halo": npart_per_halo,
         "n_halos": n_halos,
         "units_M200c": parts[0]["units_M200c"],
+        "halo_weight": halo_weight,
+        "snap_idx": snap_idx,
+        "n_snaps": len(parts),
         "comp": comp_arr,
         "func_idx": func_idx,
         "halo_idx": halo_idx,
@@ -288,6 +324,8 @@ def compute_scores(data, halo_mask=None, min_success_fraction=0.5,
     bic = data["bic"]
     nparams = data["nparams"]
     global_fid = data["global_fid"]
+    halo_weight = data.get("halo_weight",
+                           np.ones(data["n_halos"], dtype=np.float64))
 
     # Filter results to selected halos (vectorised).
     if halo_mask is not None:
@@ -300,8 +338,13 @@ def compute_scores(data, halo_mask=None, min_success_fraction=0.5,
         nparams = nparams[keep]
         global_fid = global_fid[keep]
         n_halos_total = int(halo_mask.sum())
+        total_weight = float(halo_weight[halo_mask].sum())
     else:
         n_halos_total = data["n_halos"]
+        total_weight = float(halo_weight.sum())
+
+    # Per-result weights (looked up from halo weights).
+    result_weight = halo_weight[halo_idx]
 
     if len(global_fid) == 0:
         return {}, []
@@ -309,8 +352,9 @@ def compute_scores(data, halo_mask=None, min_success_fraction=0.5,
     unique_gfid, first_idx, inv, counts = np.unique(
         global_fid, return_index=True, return_inverse=True,
         return_counts=True)
-    sum_ce = np.bincount(inv, weights=ce)
-    sum_bic = np.bincount(inv, weights=bic)
+    wsum_ce = np.bincount(inv, weights=ce * result_weight)
+    wsum_bic = np.bincount(inv, weights=bic * result_weight)
+    wsum = np.bincount(inv, weights=result_weight)
 
     # Per-function metadata (first occurrence).
     k_arr = nparams[first_idx]
@@ -323,7 +367,7 @@ def compute_scores(data, halo_mask=None, min_success_fraction=0.5,
         avg_ce = np.empty(len(unique_gfid))
         avg_bic = np.empty(len(unique_gfid))
 
-        needs_impute = counts < n_halos_total
+        needs_impute = wsum < total_weight - 1e-10
         if needs_impute.any():
             # Sort once by global_fid so per-function slicing is O(1).
             sort_idx = np.argsort(global_fid)
@@ -334,23 +378,22 @@ def compute_scores(data, halo_mask=None, min_success_fraction=0.5,
             np.cumsum(counts, out=offsets[1:])
 
         for i in range(len(unique_gfid)):
-            n_ok = int(counts[i])
-            n_fail = n_halos_total - n_ok
-            if n_fail > 0 and n_ok > 0:
+            w_ok = wsum[i]
+            w_fail = total_weight - w_ok
+            if w_fail > 1e-10 and w_ok > 1e-10:
                 s, e = int(offsets[i]), int(offsets[i + 1])
                 imp_ce = np.percentile(
                     sorted_ce[s:e], failure_loss_percentile)
                 imp_bic = np.percentile(
                     sorted_bic[s:e], failure_loss_percentile)
-                avg_ce[i] = (sum_ce[i] + n_fail * imp_ce) / n_halos_total
-                avg_bic[i] = (
-                    sum_bic[i] + n_fail * imp_bic) / n_halos_total
+                avg_ce[i] = (wsum_ce[i] + w_fail * imp_ce) / total_weight
+                avg_bic[i] = (wsum_bic[i] + w_fail * imp_bic) / total_weight
             else:
-                avg_ce[i] = sum_ce[i] / n_ok if n_ok > 0 else np.inf
-                avg_bic[i] = sum_bic[i] / n_ok if n_ok > 0 else np.inf
+                avg_ce[i] = wsum_ce[i] / w_ok if w_ok > 1e-10 else np.inf
+                avg_bic[i] = wsum_bic[i] / w_ok if w_ok > 1e-10 else np.inf
     else:
-        avg_ce = sum_ce / counts
-        avg_bic = sum_bic / counts
+        avg_ce = wsum_ce / wsum
+        avg_bic = wsum_bic / wsum
 
     min_halos = int(min_success_fraction * n_halos_total)
     keep_func = counts >= min_halos
@@ -439,6 +482,372 @@ def extract_ranked_arrays(ranked):
         "bics": np.array([r[3] for r in ranked]),
         "comps": np.array([r[0] for r in ranked]),
     }
+
+
+###############################################################################
+#                        Per-subset scoring                                   #
+###############################################################################
+
+
+def _compute_subset_rankings(data, halo_mask, **kwargs):
+    """Compute ranked list for a halo subset, returning full ranked list."""
+    if halo_mask.sum() == 0:
+        return []
+    _, ranked = compute_scores(data, halo_mask=halo_mask, **kwargs)
+    return ranked
+
+
+def _ranked_to_lookup(ranked):
+    """Convert ranked list to {(comp, fidx) -> (rank, CE, dCE)}."""
+    if not ranked:
+        return {}
+    best_ce = ranked[0][2]
+    return {(r[0], r[1]): (ri, r[2], r[2] - best_ce)
+            for ri, r in enumerate(ranked, 1)}
+
+
+def compute_subset_rankings(data, mass_edges, halo_mask=None, **kwargs):
+    """
+    Compute ranked lists for all subsets at once.
+
+    Returns
+    -------
+    dict with keys:
+        "per_snap" : {snap_idx -> lookup}
+        "per_mass" : {bin_idx -> lookup}
+        "per_snap_mass" : {(snap_idx, bin_idx) -> lookup}
+
+    Each lookup maps ``(comp, fidx) -> (rank, CE, dCE)``.
+    """
+    snap_idx = data.get("snap_idx")
+    n_snaps = data.get("n_snaps", 0)
+    M200c = data["M200c"]
+    n_bins = len(mass_edges) - 1
+
+    base_mask = halo_mask if halo_mask is not None else np.ones(
+        data["n_halos"], dtype=bool)
+
+    per_snap = {}
+    per_mass = {}
+    per_snap_mass = {}
+
+    # Per-snapshot
+    if snap_idx is not None:
+        for si in range(n_snaps):
+            m = base_mask & (snap_idx == si)
+            per_snap[si] = _ranked_to_lookup(
+                _compute_subset_rankings(data, m, **kwargs))
+
+    # Per-mass bin
+    for bi in range(n_bins):
+        lo, hi = mass_edges[bi], mass_edges[bi + 1]
+        m = base_mask & (M200c >= lo) & (M200c < hi)
+        per_mass[bi] = _ranked_to_lookup(
+            _compute_subset_rankings(data, m, **kwargs))
+
+    # Per-(snapshot, mass bin)
+    if snap_idx is not None:
+        for si in range(n_snaps):
+            for bi in range(n_bins):
+                lo, hi = mass_edges[bi], mass_edges[bi + 1]
+                m = base_mask & (snap_idx == si) & (M200c >= lo) & (M200c < hi)
+                per_snap_mass[(si, bi)] = _ranked_to_lookup(
+                    _compute_subset_rankings(data, m, **kwargs))
+
+    return {
+        "per_snap": per_snap,
+        "per_mass": per_mass,
+        "per_snap_mass": per_snap_mass,
+    }
+
+
+
+def get_function_results(data, comp, func_idx):
+    """
+    Extract all per-halo results for a single function.
+
+    Returns
+    -------
+    dict with keys: halo_idx, loss, ce, nparams, snap_idx (if available)
+    """
+    mask = (data["comp"] == comp) & (data["func_idx"] == func_idx)
+    out = {
+        "halo_idx": data["halo_idx"][mask],
+        "loss": data["loss"][mask],
+        "ce": data["ce"][mask],
+        "nparams": data["nparams"][mask][0] if mask.any() else 0,
+    }
+    if "snap_idx" in data:
+        out["snap_idx"] = data["snap_idx"][out["halo_idx"]]
+    out["M200c"] = data["M200c"][out["halo_idx"]]
+    return out
+
+
+def load_function_params(results_dir, result_patterns, comp, func_idx):
+    """
+    Load fitted parameters for a single function from HDF5 result files.
+
+    Parameters
+    ----------
+    results_dir : str or Path
+        Directory containing result HDF5 files.
+    result_patterns : list of str
+        Filename patterns with ``{comp}`` placeholder, one per snapshot.
+    comp : int
+        Complexity level.
+    func_idx : int
+        Function index within the complexity.
+
+    Returns
+    -------
+    dict
+        ``snap_index -> params array (n_halos_fitted, nparams)``
+    """
+    results_dir = Path(results_dir)
+    out = {}
+    for si, pattern in enumerate(result_patterns):
+        fpath = results_dir / pattern.format(comp=comp)
+        if not fpath.exists():
+            continue
+        with h5py.File(fpath, "r") as f:
+            fi = f["func_idx"][:]
+            mask = fi == func_idx
+            if not mask.any():
+                continue
+            params = f["params"][mask]
+            # Strip NaN padding columns
+            valid_cols = ~np.all(np.isnan(params), axis=0)
+            out[si] = params[:, valid_cols]
+    return out
+
+
+def _fmt_rank_dce(lookup, key, col_w=14):
+    """Format rank+dCE for a subset lookup, or '---'."""
+    info = lookup.get(key)
+    if info is None:
+        return f"{'---':<{col_w}}"
+    rank, ce, dce = info
+    return f"#{rank:<5} +{dce:<6.4f}" + " "
+
+
+def print_cross_snapshot_table(ranked, data, subset, n_top=20,
+                               snap_labels=None):
+    """
+    Print top functions with per-snapshot rank and dCE.
+
+    Parameters
+    ----------
+    subset : dict
+        Output of compute_subset_rankings.
+    """
+    per_snap = subset["per_snap"]
+    n_snaps = len(per_snap)
+    if snap_labels is None:
+        snap_labels = [f"S{i}" for i in range(n_snaps)]
+    eqs = data["equations"]
+
+    col_w = 14
+    snap_cols = "".join(f"{lbl:<{col_w}}" for lbl in snap_labels)
+    w = 60 + col_w * n_snaps
+    print(f"\n{'=' * w}")
+    print("RANKING BY SNAPSHOT (rank within snapshot, dCE to best)")
+    print(f"{'=' * w}")
+    print(f"{'Rank':<6} {'CE':<12} {snap_cols}{'k':<4} Equation")
+    print("-" * w)
+
+    for rank, entry in enumerate(ranked[:n_top], 1):
+        comp, fidx, ce, bic_, k, n_halos = entry
+        key = (comp, fidx)
+        cols = "".join(_fmt_rank_dce(per_snap[si], key, col_w)
+                       for si in range(n_snaps))
+        eq = _eq_str(eqs, comp, fidx, maxlen=40)
+        print(f"{rank:<6} {ce:<12.6f} {cols}{k:<4} {eq}")
+
+    print(f"{'=' * w}")
+
+
+def print_cross_mass_table(ranked, data, subset, mass_edges, n_top=20):
+    """
+    Print top functions with per-mass-bin rank and dCE.
+    """
+    per_mass = subset["per_mass"]
+    n_bins = len(mass_edges) - 1
+    eqs = data["equations"]
+
+    bin_labels = []
+    for bi in range(n_bins):
+        lo, hi = mass_edges[bi], mass_edges[bi + 1]
+        hi_s = f"{hi:.1e}" if np.isfinite(hi) else "inf"
+        bin_labels.append(f"[{lo:.1e},{hi_s})")
+
+    col_w = max(len(bl) + 2 for bl in bin_labels)
+    col_w = max(col_w, 14)
+    mass_cols = "".join(f"{lbl:<{col_w}}" for lbl in bin_labels)
+    w = 60 + col_w * n_bins
+    print(f"\n{'=' * w}")
+    print("RANKING BY MASS BIN (rank within bin, dCE to best)")
+    print(f"{'=' * w}")
+    print(f"{'Rank':<6} {'CE':<12} {mass_cols}{'k':<4} Equation")
+    print("-" * w)
+
+    for rank, entry in enumerate(ranked[:n_top], 1):
+        comp, fidx, ce, bic_, k, n_halos = entry
+        key = (comp, fidx)
+        cols = "".join(_fmt_rank_dce(per_mass[bi], key, col_w)
+                       for bi in range(n_bins))
+        eq = _eq_str(eqs, comp, fidx, maxlen=40)
+        print(f"{rank:<6} {ce:<12.6f} {cols}{k:<4} {eq}")
+
+    print(f"{'=' * w}")
+
+
+def print_cross_snap_mass_table(ranked, data, subset, mass_edges, n_top=20,
+                                snap_labels=None):
+    """
+    Print top functions with rank and dCE in each (snapshot x mass bin) cell.
+    """
+    per_snap_mass = subset["per_snap_mass"]
+    n_snaps = data.get("n_snaps", 0)
+    n_bins = len(mass_edges) - 1
+    eqs = data["equations"]
+    if snap_labels is None:
+        snap_labels = [f"S{i}" for i in range(n_snaps)]
+
+    bin_labels = []
+    for bi in range(n_bins):
+        lo, hi = mass_edges[bi], mass_edges[bi + 1]
+        hi_s = f"{hi:.1e}" if np.isfinite(hi) else "inf"
+        bin_labels.append(f"[{lo:.1e},{hi_s})")
+
+    col_w = max(max((len(bl) + 2 for bl in bin_labels), default=14), 14)
+
+    print(f"\n{'=' * 80}")
+    print("RANKING BY SNAPSHOT x MASS BIN (rank within cell, dCE to best)")
+    print(f"{'=' * 80}")
+
+    for rank, entry in enumerate(ranked[:n_top], 1):
+        comp, fidx, ce, bic_, k, n_halos = entry
+        key = (comp, fidx)
+        eq = _eq_str(eqs, comp, fidx, maxlen=60)
+        print(f"\n  #{rank} (CE={ce:.6f}, k={k}): {eq}")
+
+        # Header row
+        header = f"    {'':<14}" + "".join(f"{bl:<{col_w}}" for bl in bin_labels)
+        print(header)
+
+        for si in range(n_snaps):
+            row = f"    {snap_labels[si]:<14}"
+            for bi in range(n_bins):
+                row += _fmt_rank_dce(per_snap_mass.get((si, bi), {}),
+                                     key, col_w)
+            print(row)
+
+    print(f"\n{'=' * 80}")
+
+
+def print_function_inspector(data, ranked, subset, mass_edges,
+                             rank=None, expr=None, snap_labels=None):
+    """
+    Inspect a single function in detail.
+
+    Parameters
+    ----------
+    subset : dict
+        Output of compute_subset_rankings.
+    rank : int or None
+        1-based rank in the ranked list.
+    expr : str or None
+        Expression string to search for (partial match).
+    """
+    if rank is not None:
+        found_rank = rank
+        entry = ranked[rank - 1]
+    elif expr is not None:
+        eqs = data["equations"]
+        found_rank = None
+        for ri, entry in enumerate(ranked, 1):
+            comp, fidx = entry[0], entry[1]
+            if expr in eqs[comp][fidx]:
+                found_rank = ri
+                break
+        else:
+            print(f"Expression '{expr}' not found in ranked list.")
+            return
+    else:
+        print("Specify rank= or expr=")
+        return
+
+    comp, fidx, ce, bic_, k, n_halos = entry
+    eqs = data["equations"]
+    eq = eqs[comp][fidx]
+    key = (comp, fidx)
+
+    per_snap = subset["per_snap"]
+    per_mass = subset["per_mass"]
+    per_snap_mass = subset["per_snap_mass"]
+    n_snaps = len(per_snap)
+    n_bins = len(mass_edges) - 1
+
+    if snap_labels is None:
+        snap_labels = [f"Snap {i}" for i in range(n_snaps)]
+
+    bin_labels = []
+    for bi in range(n_bins):
+        lo, hi = mass_edges[bi], mass_edges[bi + 1]
+        hi_s = f"{hi:.1e}" if np.isfinite(hi) else "inf"
+        bin_labels.append(f"[{lo:.1e}, {hi_s})")
+
+    print(f"{'=' * 80}")
+    print(f"FUNCTION INSPECTOR — Rank #{found_rank}/{len(ranked)}")
+    print(f"{'=' * 80}")
+    print(f"Expression : {eq}")
+    print(f"Complexity : {comp}")
+    print(f"Parameters : k = {k}")
+    print(f"CE (overall): {ce:.6f}")
+    print(f"BIC         : {bic_:.2f}")
+    print(f"Halos fitted: {n_halos}/{data['n_halos']}")
+
+    # Per-snapshot rank
+    print(f"\n--- Per-snapshot ---")
+    for si in range(n_snaps):
+        info = per_snap[si].get(key)
+        if info is not None:
+            r, sc, dce = info
+            print(f"  {snap_labels[si]:<14}: rank #{r:<6} CE={sc:.6f}  "
+                  f"dCE={dce:.6f}")
+        else:
+            print(f"  {snap_labels[si]:<14}: ---")
+
+    # Per-mass rank
+    print(f"\n--- Per-mass-bin ---")
+    for bi in range(n_bins):
+        info = per_mass[bi].get(key)
+        if info is not None:
+            r, sc, dce = info
+            print(f"  {bin_labels[bi]:<28}: rank #{r:<6} CE={sc:.6f}  "
+                  f"dCE={dce:.6f}")
+        else:
+            print(f"  {bin_labels[bi]:<28}: ---")
+
+    # 2D table: snapshot x mass bin
+    col_w = max(14, max((len(bl) + 2 for bl in bin_labels), default=14))
+    print(f"\n--- Snapshot x mass bin ---")
+    header = f"  {'':<14}" + "".join(f"{bl:<{col_w}}" for bl in bin_labels)
+    print(header)
+    for si in range(n_snaps):
+        row = f"  {snap_labels[si]:<14}"
+        for bi in range(n_bins):
+            row += _fmt_rank_dce(per_snap_mass.get((si, bi), {}), key, col_w)
+        print(row)
+
+    # Per-halo results
+    res = get_function_results(data, comp, fidx)
+    print(f"\n--- Per-halo CE stats ---")
+    print(f"  min    : {res['ce'].min():.6f}")
+    print(f"  median : {np.median(res['ce']):.6f}")
+    print(f"  max    : {res['ce'].max():.6f}")
+    print(f"  std    : {res['ce'].std():.6f}")
+    print(f"{'=' * 80}")
 
 
 def pareto_front(x, y):

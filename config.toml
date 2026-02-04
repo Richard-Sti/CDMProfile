@@ -10,6 +10,13 @@ runname = "ext_maths_DM"
 # Can be overridden entirely with --halos command line argument
 halos = "tng_particles/particles_{snap:03d}.hdf5"
 
+# Variable substitution: if true, x = r / Rs (Rs is fitted).
+# If false, x = r (no scale radius parameter).
+use_scaled_radius = false
+
+# Dry run: fit functions but do not save any results to disk.
+dry_run = true
+
 # Binning
 nbin = 100
 n_sample = 0  # Downsample halos to this many particles (0 = no downsampling)
@@ -64,8 +71,8 @@ nfw_early_stop_same_halos = true  # Compare against NFW avg for same N halos (tr
 Rs_lower_factor = 0.25      # Rs_min = rmin * Rs_lower_factor
 Rs_upper_factor = 10.0      # Rs_max = rmax * Rs_upper_factor
 # a0-a3 bounds (absolute)
-a_lower = -10.0
-a_upper = 10.0
+a_lower = -1000.0
+a_upper = 1000.0
 
 [asymptotes]
 # Post-fit asymptote validation for parameter-dependent functions
