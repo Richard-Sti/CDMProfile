@@ -1,5 +1,5 @@
 #!/bin/bash
-memory=7
+memory=21
 queue="berg"
 
 on_login=${1}

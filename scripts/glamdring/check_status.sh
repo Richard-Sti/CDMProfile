@@ -20,7 +20,7 @@
 # Defaults
 runname="ext_maths_DM"
 snaps="33,50,99"
-comps="1,2,3,4,5,6,7"
+comps="1,2,3,4,5,6,7,8"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
