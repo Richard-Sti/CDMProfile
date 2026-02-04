@@ -19,21 +19,29 @@ Uses dynamic work distribution (master-worker pattern) where rank 0
 distributes batches of functions to worker ranks.
 """
 import os
-import pickle
-import shutil
-import tempfile
-import warnings
-from argparse import ArgumentParser
-from datetime import datetime
-from pathlib import Path
-from time import time
 
-import cdmprof
-import h5py
-import numpy as np
-from mpi4py import MPI
+# Disable BLAS/OpenMP thread pools before importing numpy/cdmprof.
+# After os.fork(), only the calling thread survives — if a BLAS worker thread
+# holds a mutex at fork time, the child deadlocks on the first numpy operation.
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
 
-from utils import (compute_function_scores, print_best_results,
+import pickle  # noqa: E402
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+import warnings  # noqa: E402
+from argparse import ArgumentParser  # noqa: E402
+from datetime import datetime  # noqa: E402
+from pathlib import Path  # noqa: E402
+from time import time  # noqa: E402
+
+import cdmprof  # noqa: E402
+import h5py  # noqa: E402
+import numpy as np  # noqa: E402
+from mpi4py import MPI  # noqa: E402
+
+from utils import (compute_function_scores, print_best_results,  # noqa: E402
                    print_failed_functions, read_config)
 
 # MPI tags
