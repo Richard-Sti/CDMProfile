@@ -65,7 +65,7 @@ basepath="/mnt/extraspace/rstiskalek/TNG300-1-Dark/output"
 # Selection criteria
 min_mass=1e12               # Msun/h
 max_offset=0.1              # Fraction of R200c
-max_satellite_ratio=0.005    # Max satellite/central mass ratio
+max_satellite_ratio=0.005   # Max satellite/central mass ratio
 isolation_distance=5.0      # In units of R200c
 isolation_mass_ratio=0.1    # Reject if neighbor > ratio * M_self
 subsample="10000"           # Set to e.g. 10000 to subsample particles
