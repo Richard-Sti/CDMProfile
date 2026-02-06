@@ -578,6 +578,11 @@ def _process_batch_in_subprocess(func_indices, equations, binned, fit_config,
     fd, tmp_path = tempfile.mkstemp(suffix='.pkl')
     os.close(fd)
 
+    # Create a per-child temp directory for CFFI .so files.
+    # This prevents disk accumulation: each child writes its .so files here,
+    # and the parent deletes the entire directory after the child exits.
+    cffi_tmp_dir = tempfile.mkdtemp(prefix='cffi_child_')
+
     pid = os.fork()
 
     if pid == 0:
@@ -587,6 +592,10 @@ def _process_batch_in_subprocess(func_indices, equations, binned, fit_config,
         # includes MPI.Finalize() registered by mpi4py — corrupting MPI
         # state for the parent.
         try:
+            # Redirect CFFI compilations to child-specific temp directory
+            cdmprof.fitting.CFFI_TMPDIR = cffi_tmp_dir
+            cdmprof.symbolic.CFFI_TMPDIR = cffi_tmp_dir
+
             results = []
             for i, func_idx in enumerate(func_indices):
                 expr_str = equations[func_idx]
@@ -627,6 +636,9 @@ def _process_batch_in_subprocess(func_indices, equations, binned, fit_config,
     else:
         # === Parent process ===
         _, wait_status = os.waitpid(pid, 0)
+
+        # Clean up child's CFFI temp directory (always, regardless of outcome)
+        shutil.rmtree(cffi_tmp_dir, ignore_errors=True)
 
         if wait_status != 0:
             if os.WIFEXITED(wait_status):
@@ -1199,12 +1211,10 @@ if __name__ == "__main__":
     temp_dir_name = f"tmp_fit_{runname}_compl{args.complexity}_{halos_name}"
     temp_dir = results_base / temp_dir_name
 
-    # Per-job CFFI cache directory to avoid .so collisions between
-    # concurrent jobs (different complexity levels or snapshots).
-    cffi_cache_name = (f"cffi_cache_{runname}"
-                       f"_compl{args.complexity}_{halos_name}")
-    cffi_cache = results_base / cffi_cache_name
-    cffi_cache.mkdir(parents=True, exist_ok=True)
+    # Per-job CFFI cache directory for NFW compilation at startup.
+    # Use a temp directory to avoid conflicts between parallel jobs.
+    # Child processes override this with their own temp dirs anyway.
+    cffi_cache = tempfile.mkdtemp(prefix='cffi_main_')
     cdmprof.fitting.CFFI_TMPDIR = cffi_cache
     cdmprof.symbolic.CFFI_TMPDIR = cffi_cache
 
@@ -1713,9 +1723,10 @@ if __name__ == "__main__":
                 print(f"  Wall time: {format_time(total_mpi_time)}",
                       flush=True)
 
+    # Wait for rank 0 to finish post-processing before MPI_Finalize,
+    # otherwise PMIx collective fence times out on idle ranks.
+    comm.Barrier()
+
     # Clean up per-job CFFI cache directory
-    if rank == 0 and cffi_cache.exists():
-        try:
-            shutil.rmtree(cffi_cache)
-        except OSError:
-            pass  # NFS may lag; harmless leftover
+    if rank == 0:
+        shutil.rmtree(cffi_cache, ignore_errors=True)
