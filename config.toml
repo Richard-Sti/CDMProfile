@@ -12,10 +12,10 @@ halos = "tng_particles/particles_{snap:03d}.hdf5"
 
 # Variable substitution: if true, x = r / Rs (Rs is fitted).
 # If false, x = r (no scale radius parameter).
-use_scaled_radius = false
+use_scaled_radius = true
 
 # Dry run: fit functions but do not save any results to disk.
-dry_run = true
+dry_run = false
 
 # Binning
 nbin = 100
