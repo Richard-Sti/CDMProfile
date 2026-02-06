@@ -6,3 +6,4 @@ data/
 __pycache__/
 settings.json
 notes.txt
+python.sh
