@@ -49,7 +49,7 @@ WORK_TAG = 1
 DONE_TAG = 0
 
 # Maximum number of parameters to store (for fixed-size HDF5 datasets)
-MAX_NPARAMS = 10
+MAX_NPARAMS = 5
 
 
 def _timestamp():
@@ -825,6 +825,9 @@ class ResultsFile:
         """
         Merge results_rank*.hdf5 files into a single output file.
 
+        Streams one rank file at a time to avoid loading all results into
+        memory simultaneously.
+
         Parameters
         ----------
         input_dir : Path
@@ -853,15 +856,6 @@ class ResultsFile:
 
         print(f"Merging {len(rank_files)} rank files...", flush=True)
 
-        # Collect all data
-        all_results = {name: [] for name in cls.RESULT_FIELDS}
-        all_neg_loss = set()
-        all_asymp_reject = set()
-        all_asymp_pass = {}
-        all_processed = set()
-        nfw_score = None
-        equations = None
-
         # Source files: existing output (if appending) + rank files
         source_files = []
         if append_to_existing and output_path.exists():
@@ -869,18 +863,26 @@ class ResultsFile:
             source_files.append(output_path)
         source_files.extend(rank_files)
 
+        # --- First pass: collect metadata and determine sizes ---
+        all_neg_loss = set()
+        all_asymp_reject = set()
+        all_asymp_pass = {}
+        all_processed = set()
+        nfw_score = None
+        equations = None
+        max_ncols = 0
+        total_rows = 0
+
         for fpath in source_files:
             with h5py.File(fpath, 'r') as f:
-                # Read result arrays
                 if 'func_idx' in f:
-                    for name in cls.RESULT_FIELDS:
-                        all_results[name].append(f[name][:])
+                    total_rows += len(f['func_idx'])
+                    if 'params' in f:
+                        max_ncols = max(max_ncols, f['params'].shape[1])
 
-                # Read equations (first found)
                 if equations is None and 'equations' in f:
                     equations = f['equations'][:]
 
-                # Read metadata
                 all_neg_loss |= cls._read_index_set(
                     f, 'negative_loss_func_idx')
                 all_asymp_reject |= cls._read_index_set(
@@ -892,78 +894,126 @@ class ResultsFile:
                 if nfw_score is None and 'nfw_score' in f.attrs:
                     nfw_score = f.attrs['nfw_score']
 
-        if not all_results['func_idx'] and not all_processed:
+        if total_rows == 0 and not all_processed:
             print("No data to merge")
             return 0
 
-        # Concatenate results
-        has_results = len(all_results['func_idx']) > 0
-        if has_results:
-            # Pad params arrays to same width
-            max_ncols = max(p.shape[1] for p in all_results['params'])
-            padded = []
-            for p in all_results['params']:
-                if p.shape[1] < max_ncols:
-                    p = np.pad(p, ((0, 0), (0, max_ncols - p.shape[1])),
-                               constant_values=np.nan)
-                padded.append(p)
-            all_results['params'] = padded
+        if max_ncols == 0:
+            max_ncols = MAX_NPARAMS
 
-            merged = {name: np.concatenate(all_results[name])
-                      for name in cls.RESULT_FIELDS}
+        # --- Second pass: stream results into output file ---
+        # Use a temp file to avoid conflicts when a source is the output.
+        tmp_output = output_path.with_suffix('.tmp.hdf5')
+        DTYPES = {
+            'func_idx': np.int32, 'halo_idx': np.int32,
+            'loss': np.float64, 'params': np.float64,
+            'nparams': np.int32, 'converged': np.int32, 'neval': np.int32,
+        }
 
-            n_total = len(merged['func_idx'])
-            n_funcs = len(np.unique(merged['func_idx']))
-            n_halos = len(np.unique(merged['halo_idx']))
-
-            # Filter params for functions worse than NFW
-            if npart_per_halo is not None and nfw_score is not None:
-                npart = np.asarray(npart_per_halo)
-                norm_loss = merged['loss'] / npart[merged['halo_idx']]
-                unique_f, inv, counts = np.unique(
-                    merged['func_idx'], return_inverse=True,
-                    return_counts=True)
-                sums = np.bincount(inv, weights=norm_loss)
-                means = sums / counts
-                n_miss = len(npart) - counts
-                penalty = np.where(n_miss > 0, n_miss * means, 0.0)
-                scores = (sums + penalty) / len(npart)
-
-                good = set(unique_f[scores <= nfw_score])
-                n_bad = len(unique_f) - len(good)
-                print(f"Params filter: {len(good)} functions <= NFW, "
-                      f"{n_bad} functions > NFW (params cleared)", flush=True)
-                bad_mask = ~np.isin(merged['func_idx'], list(good))
-                merged['params'][bad_mask] = np.nan
-        else:
-            merged = None
-            n_total = n_funcs = n_halos = 0
-
-        # Write output
-        with h5py.File(output_path, 'w') as f:
-            if has_results:
+        with h5py.File(tmp_output, 'w') as fout:
+            if total_rows > 0:
+                # Create pre-sized datasets
+                datasets = {}
                 for name in cls.RESULT_FIELDS:
                     if name == 'params':
-                        f.create_dataset(
-                            name, data=merged[name],
+                        ds = fout.create_dataset(
+                            name, shape=(total_rows, max_ncols),
+                            dtype=DTYPES[name], chunks=True,
                             compression='gzip', compression_opts=4)
                     else:
-                        f.create_dataset(name, data=merged[name])
+                        ds = fout.create_dataset(
+                            name, shape=(total_rows,),
+                            dtype=DTYPES[name], chunks=True)
+                    datasets[name] = ds
 
+                # Stream one rank file at a time
+                offset = 0
+                for fpath in source_files:
+                    with h5py.File(fpath, 'r') as f:
+                        if 'func_idx' not in f:
+                            continue
+
+                        n = len(f['func_idx'])
+                        for name in cls.RESULT_FIELDS:
+                            if name == 'params':
+                                data = f[name][:]
+                                if data.shape[1] < max_ncols:
+                                    data = np.pad(
+                                        data,
+                                        ((0, 0),
+                                         (0, max_ncols - data.shape[1])),
+                                        constant_values=np.nan)
+                                datasets[name][offset:offset + n] = data
+                            else:
+                                datasets[name][offset:offset + n] = f[name][:]
+
+                        offset += n
+
+                # Compute summary stats and NFW filtering
+                n_total = total_rows
+                func_idx = datasets['func_idx'][:]
+                halo_idx = datasets['halo_idx'][:]
+                n_funcs = len(np.unique(func_idx))
+                n_halos = len(np.unique(halo_idx))
+
+                # Filter params for functions worse than NFW
+                if npart_per_halo is not None and nfw_score is not None:
+                    npart = np.asarray(npart_per_halo)
+                    loss = datasets['loss'][:]
+                    norm_loss = loss / npart[halo_idx]
+                    del loss
+
+                    unique_f, inv, counts = np.unique(
+                        func_idx, return_inverse=True,
+                        return_counts=True)
+                    sums = np.bincount(inv, weights=norm_loss)
+                    del norm_loss
+                    means = sums / counts
+                    n_miss = len(npart) - counts
+                    penalty = np.where(n_miss > 0, n_miss * means, 0.0)
+                    scores = (sums + penalty) / len(npart)
+
+                    good = set(unique_f[scores <= nfw_score])
+                    n_bad = len(unique_f) - len(good)
+                    print(
+                        f"Params filter: {len(good)} functions <= NFW, "
+                        f"{n_bad} functions > NFW (params cleared)",
+                        flush=True)
+                    bad_mask = ~np.isin(func_idx, list(good))
+                    del func_idx, halo_idx
+
+                    # Update params in chunks to avoid loading all
+                    # into memory at once.
+                    CHUNK = 1_000_000
+                    for i in range(0, n_total, CHUNK):
+                        j = min(i + CHUNK, n_total)
+                        chunk_mask = bad_mask[i:j]
+                        if chunk_mask.any():
+                            p = datasets['params'][i:j]
+                            p[chunk_mask] = np.nan
+                            datasets['params'][i:j] = p
+            else:
+                n_total = n_funcs = n_halos = 0
+
+            # Write metadata
             if equations is not None:
                 dt = h5py.special_dtype(vlen=str)
-                f.create_dataset('equations', data=equations, dtype=dt)
+                fout.create_dataset('equations', data=equations, dtype=dt)
 
-            cls._write_index_set(f, 'negative_loss_func_idx', all_neg_loss)
-            cls._write_index_set(f, 'asymp_reject_func_idx', all_asymp_reject)
-            cls._write_asymp_pass(f, all_asymp_pass)
-            cls._write_index_set(f, 'processed_func_idx', all_processed)
+            cls._write_index_set(fout, 'negative_loss_func_idx', all_neg_loss)
+            cls._write_index_set(
+                fout, 'asymp_reject_func_idx', all_asymp_reject)
+            cls._write_asymp_pass(fout, all_asymp_pass)
+            cls._write_index_set(fout, 'processed_func_idx', all_processed)
 
             if nfw_score is not None:
-                f.attrs['nfw_score'] = nfw_score
-            f.attrs['n_results'] = n_total
-            f.attrs['n_functions'] = n_funcs
-            f.attrs['n_halos'] = n_halos
+                fout.attrs['nfw_score'] = nfw_score
+            fout.attrs['n_results'] = n_total
+            fout.attrs['n_functions'] = n_funcs
+            fout.attrs['n_halos'] = n_halos
+
+        # Replace output with the completed temp file
+        tmp_output.rename(output_path)
 
         # Print summary
         n_proc = len(all_processed)
@@ -1197,6 +1247,9 @@ if __name__ == "__main__":
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
+
+    if rank == 0:
+        print(f"Running with {size} MPI ranks", flush=True)
 
     # Derive output filename from halos path, runname, and complexity
     halos_path = Path(halos_input)
