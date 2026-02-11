@@ -291,36 +291,35 @@ def compute_function_scores(output_path, npart_per_halo,
     bic_per_result = (nparams_per_result * np.log(npart_per_result)
                       + 2 * loss)
 
-    unique_funcs, inverse_idx, counts = np.unique(
-        func_idx, return_inverse=True, return_counts=True)
+    unique_funcs, first_idx, inverse_idx, counts = np.unique(
+        func_idx, return_index=True, return_inverse=True,
+        return_counts=True)
     sum_per_func = np.bincount(inverse_idx, weights=normalized_loss)
     sum_bic_per_func = np.bincount(inverse_idx, weights=bic_per_result)
 
-    # Get nparams per function (same for all halos of a function)
-    nparams_per_func = np.zeros(len(unique_funcs), dtype=int)
-    for i, fidx in enumerate(unique_funcs):
-        mask = func_idx == fidx
-        nparams_per_func[i] = nparams_per_result[mask][0]
+    # Get nparams per function (same for all halos, take first occurrence)
+    nparams_per_func = nparams_per_result[first_idx]
 
     # Compute scores with optional imputation for failed halos
     if failure_loss_percentile > 0:
-        # For each function, compute percentile of successful fits
-        # and use it to impute missing halos
+        # Sort results by function group for efficient per-function access
+        sort_idx = np.argsort(inverse_idx, kind='mergesort')
+        sorted_losses = normalized_loss[sort_idx]
+        sorted_bics = bic_per_result[sort_idx]
+        split_points = np.cumsum(counts[:-1])
+        loss_groups = np.split(sorted_losses, split_points)
+        bic_groups = np.split(sorted_bics, split_points)
+
         avg_scores = np.zeros(len(unique_funcs))
         avg_bic = np.zeros(len(unique_funcs))
-        for i, (fidx, n_success) in enumerate(zip(unique_funcs, counts)):
-            # Get normalized losses for this function
-            func_mask = func_idx == fidx
-            func_losses = normalized_loss[func_mask]
-            func_bics = bic_per_result[func_mask]
-
+        for i, n_success in enumerate(counts):
             n_failed = n_halos_total - n_success
             if n_failed > 0 and n_success > 0:
                 # Impute using percentile of successful fits
                 imputed_loss = np.percentile(
-                    func_losses, failure_loss_percentile)
+                    loss_groups[i], failure_loss_percentile)
                 imputed_bic = np.percentile(
-                    func_bics, failure_loss_percentile)
+                    bic_groups[i], failure_loss_percentile)
                 total_loss = sum_per_func[i] + n_failed * imputed_loss
                 total_bic = sum_bic_per_func[i] + n_failed * imputed_bic
                 avg_scores[i] = total_loss / n_halos_total
